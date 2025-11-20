@@ -4,3 +4,4 @@ numpy
 faster-whisper
 pydantic
 python-multipart
+paho-mqtt
