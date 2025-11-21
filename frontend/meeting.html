@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 면접 시스템</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.webgpu.min.js"></script>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            height: 100vh;
+            width: 100vw;
+            background-color: #1e1e1e; /* 어두운 배경 */
+            color: #ffffff;
+            font-family: Arial, sans-serif;
+            overflow: hidden; /* 스크롤바 제거 */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        /* 메인 컨테이너: 화면 전체를 덮고 좌우 분할 */
+        .main-container {
+            display: flex;
+            width: 90%; /* 화면 너비의 90% 사용 */
+            height: 90vh; /* 화면 높이의 90% 사용 */
+            max-width: 1600px;
+            gap: 20px;
+        }
+
+        /* 좌측 영역 (면접 화면) */
+        .interview-area {
+            flex: 2; /* 60% 비율 */
+            display: flex;
+            flex-direction: column;
+            background-color: #2a2a2a;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+        }
+
+        /* 우측 영역 (AI 분석) */
+        .ai-analysis-area {
+            flex: 1; /* 40% 비율 */
+            display: flex;
+            flex-direction: column;
+            background-color: #2a2a2a;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+            min-width: 400px; /* 최소 너비 지정 */
+        }
+
+        /* 비디오 컨테이너 */
+        .video-wrapper {
+            position: relative;
+            flex-grow: 1;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin-top: 15px;
+            border-radius: 5px;
+            background-color: #000; /* 비디오가 채워지지 않은 공간은 검은색 */
+        }
+
+        /* 비디오 요소 스타일 */
+        video {
+            width: 100%;
+            height: auto;
+            max-height: 100%;
+            object-fit: contain; /* 비율을 유지하며 컨테이너에 맞춤 */
+            border-radius: 5px;
+        }
+
+        /* AI 분석 캔버스 컨테이너 (우측) */
+        #ai-canvas-wrapper {
+            position: relative;
+            width: 100%;
+            padding-top: 100%; /* 1:1 비율 유지를 위해 padding-top 사용 (640x640) */
+            margin-top: 15px;
+            border-radius: 5px;
+            background-color: #000;
+        }
+        
+        /* 캔버스 요소 (AI 분석 결과가 그려지는 곳) */
+        #aiCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%; /* 화면 표시 영역 꽉 채우기 */
+            height: 100%;
+            z-index: 10; /* 원래의 z-index로 복구 */
+            /* 디버그용 border, z-index: 9999 등은 모두 제거되었습니다. */
+        }
+
+        /* AI 분석 소스 비디오 (화면에 표시 안 되도록 숨김) */
+        #aiCam {
+            display: none;
+        }
+
+        /* 컨트롤 버튼 영역 */
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 20px;
+            padding-top: 10px;
+            border-top: 1px solid #3c3c3c;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background-color 0.3s;
+        }
+
+        #joinBtn {
+            background-color: #4CAF50; /* Green */
+            color: white;
+        }
+
+        #joinBtn:hover {
+            background-color: #45a049;
+        }
+
+        #leaveBtn {
+            background-color: #f44336; /* Red */
+            color: white;
+        }
+
+        #leaveBtn:hover {
+            background-color: #da190b;
+        }
+        
+        /* 제목 스타일 */
+        h2 {
+            margin-top: 0;
+            font-size: 1.5rem;
+            color: #ccc;
+        }
+        
+        /* Remote 비디오는 중앙에 배치 */
+        #remoteVideo {
+            width: 100%; 
+            height: 100%;
+            object-fit: cover;
+        }
+
+        /* Local 비디오는 작은 창으로 우측 하단에 오버레이 */
+        #localVideo {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            width: 25%; /* 상대적으로 작은 크기 */
+            height: auto;
+            border: 3px solid #3c3c3c;
+            z-index: 20;
+        }
+
+    </style>
+</head>
+<body>
+    <div class="main-container">
+
+        <div class="interview-area">
+            <h2>🎙️ 면접 화면</h2>
+            <div class="video-wrapper">
+                <video id="remoteVideo" autoplay playsinline></video>
+                <video id="localVideo" muted autoplay playsinline></video>
+            </div>
+            
+            <div class="controls">
+                <button id="joinBtn" class="btn">입장하기 (Join)</button>
+                <button id="leaveBtn" class="btn">나가기 (Leave)</button>
+            </div>
+        </div>
+
+        <div class="ai-analysis-area">
+            <h2>👁️ AI 실시간 표정/얼굴 분석</h2>
+            <div id="ai-canvas-wrapper">
+                <canvas id="aiCanvas"></canvas>
+            </div>
+            <video id="aiCam" playsinline></video>
+
+            <div style="margin-top: 20px; text-align: center; color: #aaa;">
+                AI가 얼굴 랜드마크를 분석 중입니다.
+            </div>
+        </div>
+    </div>
+
+    <script src="meeting.js"></script>
+</body>
+</html>

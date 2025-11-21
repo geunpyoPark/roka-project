@@ -1,8 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
 from backend.routers.audio_stream import router as audio_router
-# 또는 상대 import로
-# from .routers.audio_stream import router as audio_router
+from backend.mqtt_client import connect_mqtt
 
 app = FastAPI()
 
@@ -15,6 +15,13 @@ app.add_middleware(
 )
 
 app.include_router(audio_router)
+
+
+@app.on_event("startup")
+def startup_event():
+    # FastAPI 시작할 때 MQTT 한 번 연결
+    connect_mqtt()
+
 
 @app.get("/")
 def root():

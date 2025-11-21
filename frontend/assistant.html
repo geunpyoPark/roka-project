@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>AI 면접 코치</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 16px;
+      background: #111827;
+      color: #e5e7eb;
+    }
+    h1 {
+      font-size: 20px;
+      margin-bottom: 8px;
+    }
+    #status {
+      font-size: 14px;
+      margin-bottom: 12px;
+      color: #9ca3af;
+    }
+    button {
+      padding: 8px 14px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      margin-right: 8px;
+      font-size: 14px;
+    }
+    #startBtn { background: #22c55e; color: #022c22; }
+    #stopBtn  { background: #4b5563; color: #e5e7eb; }
+
+    .panel {
+      margin-top: 16px;
+      padding: 12px;
+      border-radius: 10px;
+      background: #020617;
+      border: 1px solid #1f2937;
+    }
+    .panel h2 {
+      font-size: 16px;
+      margin: 0 0 8px 0;
+      color: #f9fafb;
+    }
+    .label {
+      font-size: 12px;
+      color: #9ca3af;
+      margin-top: 4px;
+    }
+    .value {
+      font-size: 14px;
+      margin-top: 2px;
+      white-space: pre-line;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>AI 면접 코치 (Zoom/Meet용 백그라운드)</h1>
+  <div id="status">대기 중</div>
+
+  <button id="startBtn">마이크 연결 / 시작</button>
+  <button id="stopBtn" disabled>중지</button>
+
+  <div class="panel">
+    <h2>실시간 인식 문장</h2>
+    <div class="label">Transcript</div>
+    <div id="transcript" class="value">아직 말하지 않았어요.</div>
+  </div>
+
+  <div class="panel">
+    <h2>질문 의도 / 카테고리</h2>
+    <div class="label">예: 자기소개 / 지원동기 / 꼬리질문 등</div>
+    <div id="intent" class="value">-</div>
+  </div>
+
+  <div class="panel">
+    <h2>답변 팁</h2>
+    <div class="label">지금 질문에 이렇게 답하면 좋아요</div>
+    <div id="tip" class="value">-</div>
+  </div>
+
+  <div class="panel">
+    <h2>말 속도 / 피드백</h2>
+    <div class="label">WPM, 속도 코멘트 등</div>
+    <div id="speechInfo" class="value">-</div>
+  </div>
+
+  <script src="assistant.js"></script>
+</body>
+</html>

@@ -1,51 +1,58 @@
-import time
+# backend/routers/audio_stream.py
 from fastapi import APIRouter, WebSocket
-
-# 🔥 수정된 import 경로 — 이것이 정답
-from ..services.whisper_service import transcribe_audio
-from ..services.speech_rate import calc_cps, speed_label
-from ..services.speech_chunk import make_chunks
+from backend.mqtt_client import publish
+import time
+import json
+import math
+import struct
 
 router = APIRouter()
 
-@router.websocket("/ws/audio")
+
+def compute_rms(pcm_bytes: bytes) -> float:
+    """Int16 PCM 바이트에서 RMS(에너지) 계산"""
+    count = len(pcm_bytes) // 2  # 2바이트 = int16 한 개
+    if count == 0:
+        return 0.0
+
+    # "<h" = little-endian int16, count개
+    samples = struct.unpack("<" + "h" * count, pcm_bytes)
+    ssum = 0
+    for s in samples:
+        ssum += s * s
+    return math.sqrt(ssum / count)
+
+
+@router.websocket("/audio-stream")
 async def audio_stream(websocket: WebSocket):
+    # WebSocket 연결 수락
     await websocket.accept()
-    
-    print("🎧 WebSocket 연결됨")
 
-    audio_buffer = b""
-    start_time = time.time()
+    # 일단 하드코딩, 나중에 쿼리파라미터나 토큰으로 교체 가능
+    user_id = "test-user-1"
 
-    while True:
-        try:
+    try:
+        while True:
+            # 브라우저에서 Int16Array → 바이너리로 보내는 것을 받음
             data = await websocket.receive_bytes()
-            audio_buffer += data
-            
-            if len(audio_buffer) > 16000 * 2 * 1:  # 1 sec @ 16kHz, 16bit
-                duration = time.time() - start_time
 
-                text, segments = transcribe_audio(audio_buffer)
+            # PCM RMS 계산
+            rms = compute_rms(data)
+            num_samples = len(data) // 2  # int16 개수
 
-                cps, char_count = calc_cps(text, duration)
-                label = speed_label(cps)
-                chunks = make_chunks(segments)
+            payload = {
+                "timestamp": time.time(),
+                "user_id": user_id,
+                "num_samples": num_samples,
+                "rms": rms,
+                "note": "audio chunk received from websocket",
+            }
 
-                result = {
-                    "transcript": text,
-                    "chunks": chunks,
-                    "duration_sec": duration,
-                    "chars_per_sec": cps,
-                    "speed_label": label,
-                    "char_count": char_count
-                }
+            # MQTT 토픽 설계
+            topic = f"interview/{user_id}/audio/raw"
 
-                await websocket.send_json(result)
+            # 🔥 여기서 dict 그대로 넘기면 mqtt_client.publish 안에서 JSON으로 변환됨
+            publish(topic, payload)
 
-                # reset
-                audio_buffer = b""
-                start_time = time.time()
-
-        except Exception as e:
-            print("WebSocket 종료:", e)
-            break
+    except Exception as e:
+        print("WebSocket closed:", e)
