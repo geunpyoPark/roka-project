@@ -1,20 +1,11 @@
-# speech_rate_worker.py
+# backend/services/speech_rate_worker.py
+
 """
-MQTT로 들어오는 'speech/text' 메시지를 받아서
- - kiwi로 문장을 쪼개고
- - 말하는 데 걸린 시간으로 말속도 계산하고
- - 결과를 'speech/analysis' 토픽으로 다시 publish
+STT 텍스트를 받아서 말 속도(WPM)를 계산하고
+MQTT로 분석 결과를 퍼블리시하는 워커.
 
-토픽 구조(입력):
+입력 토픽:
   interview/{user_id}/speech/text
-
-payload 예시(whisper_worker에서 보낼 예정):
-  {
-    "user_id": "test-user-1",
-    "start_ts": 1763654900.12,
-    "end_ts": 1763654903.45,
-    "text": "자기소개를 하겠습니다. 저는 ..."
-  }
 
 출력 토픽:
   interview/{user_id}/speech/analysis
@@ -22,158 +13,143 @@ payload 예시(whisper_worker에서 보낼 예정):
 
 import json
 import time
-import math
+from typing import Dict, Any
+
 import paho.mqtt.client as mqtt
-from kiwipiepy import Kiwi
 
-BROKER_HOST = "localhost"
-BROKER_PORT = 1883
+BROKER = "localhost"
+PORT = 1883
+KEEPALIVE = 60
 
-# 사용자 여러 명을 지원하려고 +로 와일드카드
+CLIENT_ID = "speech-rate-worker"
+
+# STT 결과가 오는 토픽 패턴
 SUB_TOPIC = "interview/+/speech/text"
 
-kiwi = Kiwi()
+
+def analysis_topic(user_id: str) -> str:
+    return f"interview/{user_id}/speech/analysis"
 
 
-def classify_speed(chars_per_sec: float) -> str:
+# ---------------- 유틸 ----------------
+
+def compute_metrics(text: str, duration: float) -> Dict[str, Any]:
     """
-    말속도 레벨 분류 (대략적인 기준)
-    - slow:  <= 3 글자/초
-    - normal: 3 ~ 7 글자/초
-    - fast:  > 7 글자/초
+    텍스트와 구간 길이(초)를 가지고 기본 지표 계산.
+    duration 이 너무 작거나 0이면 최소 0.5초로 보정.
+    말도 안 되게 큰 duration(예: 수백 초)는 30초로 클램프.
     """
-    if chars_per_sec <= 3.0:
-        return "slow"
-    elif chars_per_sec <= 7.0:
-        return "normal"
+    if duration <= 0:
+        duration = 0.5
+    if duration > 30.0:
+        duration = 30.0
+
+    clean = text.strip()
+    # 공백 제외한 글자 수
+    num_chars = len(clean.replace(" ", ""))
+    # 단어 수(공백 기준)
+    num_words = len(clean.split()) if clean else 0
+
+    chars_per_sec = num_chars / duration if duration > 0 else 0.0
+    words_per_sec = num_words / duration if duration > 0 else 0.0
+    words_per_min = words_per_sec * 60.0
+
+    # 한국어 면접 기준 대략적인 속도 레이블 (임시값, 나중에 튜닝)
+    if words_per_min < 80:
+        label = "조금 느림"
+    elif words_per_min < 140:
+        label = "적당함"
+    elif words_per_min < 200:
+        label = "조금 빠름"
     else:
-        return "fast"
-
-
-def analyze_text(text: str, duration: float):
-    """
-    kiwi로 문장 단위로 쪼개고, 전체 글자수/토큰 정보, 말속도 계산
-    """
-    text = text.strip()
-    if not text:
-        return None
-
-    # 문장 단위 분리
-    sents = kiwi.split_into_sents(text)
-    # 형태소 토큰
-    tokens = kiwi.tokenize(text)
-
-    # 공백/줄바꿈 제거한 "말한 글자 수" 기준
-    no_space = "".join(ch for ch in text if not ch.isspace())
-    num_chars = len(no_space)
-
-    # 토큰 개수
-    num_tokens = len(tokens)
-
-    # duration이 0 또는 매우 작으면 안전하게 1초로 보정
-    if duration <= 0.1:
-        duration = 1.0
-
-    chars_per_sec = num_chars / duration
-    tokens_per_sec = num_tokens / duration
-    speed_level = classify_speed(chars_per_sec)
-
-    # 문장별로도 간단히 정보 남겨보자
-    chunks = []
-    for s in sents:
-        sent_text = s.text.strip()
-        if not sent_text:
-            continue
-        sent_no_space = "".join(ch for ch in sent_text if not ch.isspace())
-        chunks.append(
-            {
-                "text": sent_text,
-                "num_chars": len(sent_no_space),
-            }
-        )
+        label = "너무 빠름"
 
     return {
-        "text": text,
-        "duration": duration,
         "num_chars": num_chars,
-        "num_tokens": num_tokens,
+        "num_words": num_words,
         "chars_per_sec": chars_per_sec,
-        "tokens_per_sec": tokens_per_sec,
-        "speed_level": speed_level,
-        "chunks": chunks,
+        "words_per_sec": words_per_sec,
+        "words_per_min": words_per_min,
+        "speed_label": label,
     }
 
 
+# ---------------- MQTT 콜백 ----------------
+
 def on_connect(client, userdata, flags, reason_code, properties=None):
-    print(f"[speech_rate_worker] Connected to MQTT broker: rc={reason_code}")
-    if reason_code == 0:
-        client.subscribe(SUB_TOPIC)
-        print(f"[speech_rate_worker] Subscribed to {SUB_TOPIC}")
-    else:
-        print("[speech_rate_worker] Connection failed")
+    print(f"[speech_rate_worker] Connected: rc={reason_code}")
+    client.subscribe(SUB_TOPIC)
+    print(f"[speech_rate_worker] Subscribed to {SUB_TOPIC}")
 
 
 def on_message(client, userdata, msg):
+    topic = msg.topic
     try:
-        topic = msg.topic
-        payload = msg.payload.decode("utf-8")
-        data = json.loads(payload)
-
-        user_id = data.get("user_id", "unknown")
-        text = data.get("text", "").strip()
-
-        start_ts = data.get("start_ts")
-        end_ts = data.get("end_ts")
-
-        # duration 계산
-        if isinstance(start_ts, (int, float)) and isinstance(end_ts, (int, float)):
-            duration = max(0.0, end_ts - start_ts)
-        else:
-            # timestamp가 없으면 길이 기반 대충 추정해도 되지만,
-            # 지금은 그냥 duration=None으로 두고 analyze_text에서 1초로 보정
-            duration = 0.0
-
-        print(f"[speech_rate_worker] [{user_id}] TEXT: {text!r}")
-
-        result = analyze_text(text, duration)
-        if result is None:
-            print(f"[speech_rate_worker] [{user_id}] Empty text, skip.")
+        parts = topic.split("/")
+        # interview / {user_id} / speech / text
+        if len(parts) < 4:
+            print("[speech_rate_worker] Unexpected topic:", topic)
             return
 
-        # 결과에 user_id, start_ts, end_ts도 같이 실어 보내기
-        result_payload = {
+        _, user_id, category, subtopic, *rest = parts
+        if category != "speech" or subtopic != "text":
+            print("[speech_rate_worker] Ignore topic:", topic)
+            return
+
+        payload_str = msg.payload.decode("utf-8")
+        data = json.loads(payload_str)
+
+        text = (data.get("text") or "").strip()
+        start_ts = float(data.get("start_ts", time.time()))
+        end_ts = float(data.get("end_ts", start_ts))
+        duration = float(data.get("duration", max(end_ts - start_ts, 0.5)))
+
+        # 🔽 최소 필터: 텍스트가 아예 없으면 분석해도 의미가 없으니 조용히 무시
+        if not text:
+            print(
+                f"[speech_rate_worker] Empty text segment ignored "
+                f"(user={user_id}, dur={duration:.2f}s)"
+            )
+            return
+
+        metrics = compute_metrics(text, duration)
+        wpm = metrics["words_per_min"]
+        label = metrics["speed_label"]
+
+        out_payload: Dict[str, Any] = {
             "user_id": user_id,
             "start_ts": start_ts,
             "end_ts": end_ts,
-            **result,
+            "duration": duration,
+            "text": text,
+            **metrics,
         }
 
-        out_topic = f"interview/{user_id}/speech/analysis"
-        client.publish(out_topic, json.dumps(result_payload, ensure_ascii=False))
+        out_topic = analysis_topic(user_id)
+        client.publish(out_topic, json.dumps(out_payload, ensure_ascii=False))
+
         print(
-            f"[speech_rate_worker] Published analysis to {out_topic} "
-            f"(chars/sec={result['chars_per_sec']:.2f}, level={result['speed_level']})"
+            f"[speech_rate_worker][{user_id}] dur={duration:.2f}s, "
+            f"WPM={wpm:.1f}, label={label}, text='{text}'"
         )
 
     except Exception as e:
-        print("[speech_rate_worker] on_message error:", e)
+        print(f"[speech_rate_worker] on_message error on topic {topic}: {e}")
 
+
+# ---------------- main ----------------
 
 def main():
-    client_id = f"speech-rate-worker-{int(time.time())}"
-
-    # ✅ callback_api_version을 정식 enum으로 지정 (VERSION2 권장)
     client = mqtt.Client(
-        mqtt.CallbackAPIVersion.VERSION2,
-        client_id=client_id,
-        protocol=mqtt.MQTTv5,
+        client_id=CLIENT_ID,
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
     )
-
     client.on_connect = on_connect
     client.on_message = on_message
 
-    client.connect(BROKER_HOST, BROKER_PORT, keepalive=60)
-    print("[speech_rate_worker] Started. Waiting for messages...")
+    client.connect(BROKER, PORT, KEEPALIVE)
+    print("[speech_rate_worker] Started. Waiting for STT text...")
+
     client.loop_forever()
 
 
