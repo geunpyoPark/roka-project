@@ -41,7 +41,10 @@ function startAudioStream() {
     // 바이너리 데이터 전송을 위한 설정
     audioSocket.binaryType = "arraybuffer";
 
-    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: 16000, // ⭐ 16kHz 강제 설정 (Whisper 호환)
+    });
+    console.log("🎤 Audio Context Sample Rate:", audioContext.sampleRate);
     
     // localStream (카메라/마이크에서 얻은 스트림)에서 오디오 소스 생성
     const source = audioContext.createMediaStreamSource(localStream);

@@ -4,6 +4,9 @@ let audioContext = null;
 let processor = null;
 let micStream = null;
 
+// 분석 결과 수신용 WebSocket
+let eventsSocket = null;
+
 // ====== DOM ======
 const statusEl = document.getElementById("status");
 const transcriptEl = document.getElementById("transcript");
@@ -38,42 +41,67 @@ async function startCoach() {
     audioSocket.onopen = () => {
       statusEl.textContent = "오디오 스트림 전송 중 (Zoom/Meet에서 편하게 말해보세요)";
       setupAudioProcessing();
-    };
 
-    audioSocket.onmessage = (event) => {
-      // 백엔드에서 보내주는 JSON 메시지 처리
-      try {
-        const msg = JSON.parse(event.data);
+      // 🔹 분석 이벤트 수신용 WebSocket 같이 연결
+      //   user_id는 현재 speech_worker / whisper_worker에서 쓰는 것과 맞추기 (예: "test-user-1")
+      eventsSocket = new WebSocket("ws://127.0.0.1:8000/coach-events/test-user-1");
 
-        if (msg.type === "transcript") {
-          transcriptEl.textContent = msg.text || "";
+      eventsSocket.onopen = () => {
+        console.log("coach-events WebSocket opened");
+      };
+
+      eventsSocket.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          // console.log("coach-events msg:", msg);
+
+          if (msg.type === "speech") {
+            // 예: { type:"speech", wpm, label, duration, text }
+            const wpm = msg.wpm ? `${Math.round(msg.wpm)} WPM` : "";
+            const label = msg.label || "";
+            speechInfoEl.textContent = [wpm, label].filter(Boolean).join(" / ");
+
+            // 분석 결과에 text가 같이 들어오면 transcript에도 반영
+            if (msg.text) {
+              transcriptEl.textContent = msg.text;
+            }
+          } else if (msg.type === "transcript") {
+            // 순수 STT 텍스트만 따로 오는 경우
+            transcriptEl.textContent = msg.text || "";
+          } else if (msg.type === "intent") {
+            intentEl.textContent = msg.intent || "";
+          } else if (msg.type === "tip") {
+            tipEl.textContent = msg.tip || "";
+          }
+        } catch (e) {
+          console.error("coach-events 메시지 파싱 실패:", e, event.data);
         }
-        if (msg.type === "intent") {
-          intentEl.textContent = msg.intent || "";
-        }
-        if (msg.type === "tip") {
-          tipEl.textContent = msg.tip || "";
-        }
-        if (msg.type === "speech") {
-          // 예: { type:"speech", wpm:120, comment:"조금만 천천히" }
-          const wpm = msg.wpm ? `${msg.wpm} WPM` : "";
-          const cmt = msg.comment || "";
-          speechInfoEl.textContent = [wpm, cmt].filter(Boolean).join(" / ");
-        }
-        // 필요하면 하나의 메시지에 다 담아서 보내도 되고, 타입 안 쓰고 field 존재 여부로도 처리 가능
-      } catch (e) {
-        console.error("메시지 파싱 실패:", e, event.data);
-      }
+      };
+
+      eventsSocket.onerror = (e) => {
+        console.error("coach-events WebSocket 에러:", e);
+      };
+
+      eventsSocket.onclose = () => {
+        console.log("coach-events WebSocket closed");
+      };
     };
 
     audioSocket.onerror = (e) => {
-      console.error("WebSocket 에러:", e);
+      console.error("audio-stream WebSocket 에러:", e);
       statusEl.textContent = "WebSocket 에러 발생";
     };
 
     audioSocket.onclose = () => {
       statusEl.textContent = "연결 종료됨";
       cleanupAudio();
+
+      // 분석 WS도 같이 정리
+      if (eventsSocket && eventsSocket.readyState === WebSocket.OPEN) {
+        eventsSocket.close();
+      }
+      eventsSocket = null;
+
       startBtn.disabled = false;
       stopBtn.disabled = true;
     };
@@ -91,6 +119,13 @@ function stopCoach() {
   if (audioSocket && audioSocket.readyState === WebSocket.OPEN) {
     audioSocket.close();
   }
+  audioSocket = null;
+
+  if (eventsSocket && eventsSocket.readyState === WebSocket.OPEN) {
+    eventsSocket.close();
+  }
+  eventsSocket = null;
+
   cleanupAudio();
   statusEl.textContent = "중지됨";
   startBtn.disabled = false;

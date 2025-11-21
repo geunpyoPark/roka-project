@@ -1,6 +1,6 @@
 # backend/speech_worker.py
 """
-MQTT로 퍼블리시된 오디오 RMS(raw) 를 구독해서
+MQTT로 퍼블리시된 오디오 RMS(raw)를 구독해서
 '말하기 구간(segments)'을 잡아주는 워커.
 
 입력 토픽:
@@ -21,15 +21,21 @@ BROKER = "localhost"
 PORT = 1883
 KEEPALIVE = 60
 
-CLIENT_ID = "speech-segment-worker"
+CLIENT_ID = "speech-segment-worker-v3"
 
-# 말하기/침묵 판정 임계값 (필요하면 나중에 조절)
-RMS_THRESHOLD = 50.0
-# 말하기 최소 지속 시간 (초) - 이보다 짧으면 그냥 잡음으로 간주
-MIN_SEGMENT_DURATION = 0.3
+# ====== 튜닝 포인트 ======
+# 네 환경 기준 대략:
+#  - 말할 때: rms ~ 2000~10000
+#  - 주변 잡음: 수십~수백
+RMS_THRESHOLD = 800.0      # 필요하면 500~1500 사이 조절
 
+# 말하기 최소 지속 시간 (초) - 이보다 짧으면 노이즈로 간주해서 버림
+MIN_SEGMENT_DURATION = 0.8
 
-# 각 사용자별 상태를 저장할 딕셔너리
+# 세그먼트 최대 길이(초) - 10초 이상이면 잘라냄
+MAX_SEGMENT_DURATION = 10.0
+
+# 각 사용자별 상태 저장
 # sessions[user_id] = {
 #   "state": "silent" or "speaking",
 #   "segment_start": float | None,
@@ -40,11 +46,9 @@ sessions: Dict[str, Dict[str, Any]] = {}
 
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
-    print(f"[speech_worker] Connected to MQTT broker rc={reason_code}")
-
-    # interview/+/audio/raw 구독
+    print(f"[speech_worker v3] Connected to MQTT broker rc={reason_code}")
     client.subscribe("interview/+/audio/raw")
-    print("[speech_worker] Subscribed: interview/+/audio/raw")
+    print("[speech_worker v3] Subscribed: interview/+/audio/raw")
 
 
 def on_message(client, userdata, msg):
@@ -52,7 +56,7 @@ def on_message(client, userdata, msg):
         payload_str = msg.payload.decode("utf-8")
         data = json.loads(payload_str)
     except Exception as e:
-        print("[speech_worker] JSON decode error:", e)
+        print("[speech_worker v3] JSON decode error:", e)
         print("  topic:", msg.topic)
         print("  raw payload:", msg.payload[:100])
         return
@@ -60,7 +64,7 @@ def on_message(client, userdata, msg):
     # topic 예: interview/test-user-1/audio/raw
     parts = msg.topic.split("/")
     if len(parts) < 3:
-        print("[speech_worker] Unexpected topic format:", msg.topic)
+        print("[speech_worker v3] Unexpected topic format:", msg.topic)
         return
 
     _, user_id, _, *_ = parts  # interview / {user_id} / audio / raw
@@ -92,7 +96,7 @@ def on_message(client, userdata, msg):
             sess["last_ts"] = timestamp
             sess["max_rms"] = rms
             print(
-                f"[speech_worker] [{user_id}] SPEECH START at {timestamp:.3f} (rms={rms:.1f})"
+                f"[speech_worker v3] [{user_id}] SPEECH START at {timestamp:.3f} (rms={rms:.1f})"
             )
         else:
             # 말하는 중 계속
@@ -101,35 +105,38 @@ def on_message(client, userdata, msg):
                 sess["max_rms"] = rms
 
     else:
-        # silent
+        # silent 상태
         if prev_state == "speaking":
-            # 바로 말이 끊긴 시점 → 세그먼트 종료로 볼 수 있음
+            # 말이 끊긴 시점 → 세그먼트 종료
             sess["state"] = "silent"
             end_ts = sess["last_ts"] if sess["last_ts"] is not None else timestamp
             start_ts = sess["segment_start"] or timestamp
             duration = max(0.0, end_ts - start_ts)
 
-            if duration >= MIN_SEGMENT_DURATION:
+            # 0.8초 미만이면 그냥 노이즈로 버림
+            if duration < MIN_SEGMENT_DURATION:
+                print(
+                    f"[speech_worker v3] [{user_id}] SHORT noise ignored "
+                    f"(dur={duration:.2f}s, max_rms={sess['max_rms']:.1f})"
+                )
+            else:
+                # 너무 길면 잘라냄
+                if duration > MAX_SEGMENT_DURATION:
+                    duration = MAX_SEGMENT_DURATION
+
                 segment = {
                     "user_id": user_id,
                     "start_ts": start_ts,
-                    "end_ts": end_ts,
+                    "end_ts": start_ts + duration,
                     "duration": duration,
                     "max_rms": sess["max_rms"],
                 }
 
                 segment_topic = f"interview/{user_id}/speech/segment"
-                # 세그먼트 요약을 MQTT로 퍼블리시
-                client.publish(segment_topic, json.dumps(segment))
+                client.publish(segment_topic, json.dumps(segment, ensure_ascii=False))
                 print(
-                    f"[speech_worker] [{user_id}] SEGMENT "
-                    f"{start_ts:.2f} ~ {end_ts:.2f} "
-                    f"(dur={duration:.2f}s, max_rms={sess['max_rms']:.1f})"
-                )
-            else:
-                # 너무 짧은 소리 → 무시 (키보드 소리, 잡음 등)
-                print(
-                    f"[speech_worker] [{user_id}] SHORT noise ignored "
+                    f"[speech_worker v3] [{user_id}] SEGMENT "
+                    f"{start_ts:.2f} ~ {start_ts + duration:.2f} "
                     f"(dur={duration:.2f}s, max_rms={sess['max_rms']:.1f})"
                 )
 
@@ -138,7 +145,7 @@ def on_message(client, userdata, msg):
             sess["last_ts"] = None
             sess["max_rms"] = 0.0
         else:
-            # 지금도 silent, 원래도 silent → 아무 작업 X
+            # silent → silent : 아무 작업 없음
             pass
 
 
@@ -151,9 +158,8 @@ def main():
     client.on_message = on_message
 
     client.connect(BROKER, PORT, KEEPALIVE)
-    print("[speech_worker] MQTT client connecting...")
+    print("[speech_worker v3] MQTT client connecting...")
 
-    # 블로킹 루프
     client.loop_forever()
 
 
