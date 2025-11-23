@@ -1,14 +1,15 @@
-# backend/services/speech_rate_worker.py
-
 """
-STT 텍스트를 받아서 말 속도(WPM)를 계산하고
-MQTT로 분석 결과를 퍼블리시하는 워커.
+backend/services/speech_rate_worker.py
 
-입력 토픽:
-  interview/{user_id}/speech/text
+- Whisper 워커가 퍼블리시하는
+    interview/{user_id}/speech/text
+  을 받아서
 
-출력 토픽:
-  interview/{user_id}/speech/analysis
+  1) 말 속도(분당 단어 수 등) 계산
+  2) "너무 빠름 / 적당함" 같은 라벨링
+  3) 결과를 interview/{user_id}/speech/analysis 로 퍼블리시
+
+- 너무 짧거나, 헛소리 가능성이 높은 세그먼트는 필터링한다.
 """
 
 import json
@@ -23,133 +24,146 @@ KEEPALIVE = 60
 
 CLIENT_ID = "speech-rate-worker"
 
-# STT 결과가 오는 토픽 패턴
-SUB_TOPIC = "interview/+/speech/text"
+SUB_TOPIC_TEXT = "interview/+/speech/text"
 
 
 def analysis_topic(user_id: str) -> str:
     return f"interview/{user_id}/speech/analysis"
 
 
-# ---------------- 유틸 ----------------
+# ==============================
+# 말속도 계산 유틸
+# ==============================
 
-def compute_metrics(text: str, duration: float) -> Dict[str, Any]:
+def count_words_rough(text: str) -> int:
     """
-    텍스트와 구간 길이(초)를 가지고 기본 지표 계산.
-    duration 이 너무 작거나 0이면 최소 0.5초로 보정.
-    말도 안 되게 큰 duration(예: 수백 초)는 30초로 클램프.
+    한국어+영어 섞여 있는 문장을 대충 '단어 수'로 세는 함수.
+    - 공백으로 먼저 자르고, 너무 짧은 토큰은 묶어서 1 단어로 보정.
     """
-    if duration <= 0:
-        duration = 0.5
-    if duration > 30.0:
-        duration = 30.0
+    text = text.strip()
+    if not text:
+        return 0
 
-    clean = text.strip()
-    # 공백 제외한 글자 수
-    num_chars = len(clean.replace(" ", ""))
-    # 단어 수(공백 기준)
-    num_words = len(clean.split()) if clean else 0
+    tokens = text.split()
+    if not tokens:
+        # 공백이 거의 없으면 글자수 기반으로 대충 환산
+        # (한글 5~6글자 ≈ 1 단어 정도로 가정)
+        return max(1, len(text) // 5)
 
-    chars_per_sec = num_chars / duration if duration > 0 else 0.0
-    words_per_sec = num_words / duration if duration > 0 else 0.0
-    words_per_min = words_per_sec * 60.0
+    # 공백 단위 토큰 수에 가중치 약간 더해서 반환
+    return max(1, len(tokens))
 
-    # 한국어 면접 기준 대략적인 속도 레이블 (임시값, 나중에 튜닝)
-    if words_per_min < 80:
-        label = "조금 느림"
-    elif words_per_min < 140:
-        label = "적당함"
-    elif words_per_min < 200:
-        label = "조금 빠름"
+
+def label_speed(wpm: float) -> str:
+    """
+    WPM(단어/분)에 따라 말속도 라벨을 단순하게 나눈다.
+    실제 인터뷰에서는 값만 써도 되고, 라벨은 적당히 조정하면 된다.
+    """
+    if wpm < 80:
+        return "조금 느림"
+    elif wpm < 160:
+        return "적당함"
+    elif wpm < 220:
+        return "조금 빠름"
     else:
-        label = "너무 빠름"
-
-    return {
-        "num_chars": num_chars,
-        "num_words": num_words,
-        "chars_per_sec": chars_per_sec,
-        "words_per_sec": words_per_sec,
-        "words_per_min": words_per_min,
-        "speed_label": label,
-    }
+        return "너무 빠름"
 
 
-# ---------------- MQTT 콜백 ----------------
+# ==============================
+# MQTT 콜백
+# ==============================
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
     print(f"[speech_rate_worker] Connected: rc={reason_code}")
-    client.subscribe(SUB_TOPIC)
-    print(f"[speech_rate_worker] Subscribed to {SUB_TOPIC}")
+    client.subscribe(SUB_TOPIC_TEXT)
+    print(f"[speech_rate_worker] Subscribed to {SUB_TOPIC_TEXT}")
 
 
 def on_message(client, userdata, msg):
     topic = msg.topic
     try:
         parts = topic.split("/")
-        # interview / {user_id} / speech / text
         if len(parts) < 4:
-            print("[speech_rate_worker] Unexpected topic:", topic)
+            print("[speech_rate_worker] Invalid topic:", topic)
             return
-
         _, user_id, category, subtopic, *rest = parts
         if category != "speech" or subtopic != "text":
-            print("[speech_rate_worker] Ignore topic:", topic)
             return
 
         payload_str = msg.payload.decode("utf-8")
         data = json.loads(payload_str)
 
         text = (data.get("text") or "").strip()
-        start_ts = float(data.get("start_ts", time.time()))
-        end_ts = float(data.get("end_ts", start_ts))
-        duration = float(data.get("duration", max(end_ts - start_ts, 0.5)))
+        duration = float(data.get("duration") or 0.0)
 
-        # 🔽 최소 필터: 텍스트가 아예 없으면 분석해도 의미가 없으니 조용히 무시
+        # duration 이 0 이거나 너무 작으면, 최소 0.5초로 보정
+        if duration < 0.5:
+            duration = 0.5
+
         if not text:
+            # 빈 텍스트는 바로 버리기
             print(
                 f"[speech_rate_worker] Empty text segment ignored "
                 f"(user={user_id}, dur={duration:.2f}s)"
             )
             return
 
-        metrics = compute_metrics(text, duration)
-        wpm = metrics["words_per_min"]
-        label = metrics["speed_label"]
+        # 너무 짧은 텍스트(헛소리 가능성 높음)는 버리기
+        if len(text) < 3:
+            print(
+                f"[speech_rate_worker] Too short text ignored "
+                f"(user={user_id}, dur={duration:.2f}s, text='{text}')"
+            )
+            return
 
-        out_payload: Dict[str, Any] = {
+        # 단어 수 / 분당 단어 수 계산
+        word_count = count_words_rough(text)
+        wpm = word_count / (duration / 60.0)  # 단어/분
+        cps = len(text) / duration           # 글자/초
+
+        # 말속도 라벨
+        speed_label = label_speed(wpm)
+
+        # 말도 안 되는 값(예: 400 WPM 이상)은 헛소리거나 duration 추정이 잘못된 것으로 간주하고 버림
+        if wpm > 400:
+            print(
+                f"[speech_rate_worker] Unrealistic WPM ignored "
+                f"(user={user_id}, WPM={wpm:.1f}, dur={duration:.2f}s, text='{text[:20]}...')"
+            )
+            return
+
+        result = {
             "user_id": user_id,
-            "start_ts": start_ts,
-            "end_ts": end_ts,
             "duration": duration,
+            "words_per_min": wpm,
+            "chars_per_sec": cps,
+            "speed_label": speed_label,
             "text": text,
-            **metrics,
+            "timestamp": time.time(),
         }
 
         out_topic = analysis_topic(user_id)
-        client.publish(out_topic, json.dumps(out_payload, ensure_ascii=False))
-
+        client.publish(out_topic, json.dumps(result, ensure_ascii=False))
         print(
             f"[speech_rate_worker][{user_id}] dur={duration:.2f}s, "
-            f"WPM={wpm:.1f}, label={label}, text='{text}'"
+            f"WPM={wpm:.1f}, label={speed_label}, text='{text}'"
         )
 
     except Exception as e:
         print(f"[speech_rate_worker] on_message error on topic {topic}: {e}")
 
 
-# ---------------- main ----------------
-
 def main():
     client = mqtt.Client(
         client_id=CLIENT_ID,
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+        protocol=mqtt.MQTTv5,
     )
     client.on_connect = on_connect
     client.on_message = on_message
 
     client.connect(BROKER, PORT, KEEPALIVE)
     print("[speech_rate_worker] Started. Waiting for STT text...")
-
     client.loop_forever()
 
 

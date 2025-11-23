@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package dagloapis.speech.v1;
+
+// 음성인식 API를 구현하는 서비스
+service Speech {
+  // 양방향 스트리밍 방식으로 음성 인식을 수행합니다. 오디오를 전송하는 동시에 결과를 수신합니다.
+  rpc StreamingRecognize(stream StreamingRecognizeRequest)
+      returns (stream StreamingRecognizeResponse) {}
+}
+
+// `StreamingRecognize` 메서드에서 클라이언트가 전송하는 최상위 메시지.
+// `StreamingRecognizeRequest` 메시지는 두 종류가 있습니다.
+// 첫 번째 메시지는 반드시 `config` 필드를 포함해야 하며 `audio_content`는 포함하지 않아야 합니다.
+// 이후에 전송되는 모든 메시지는 `audio_content`를 포함해야 하며 `config`는 포함하지 않아야 합니다.
+message StreamingRecognizeRequest {
+  // 스트리밍 요청은 스트리밍 설정(config) 혹은 오디오 스트림입니다.
+  oneof streaming_request {
+    // 오디오 및 음성 인식 처리에 관한 설정 정보를 제공합니다.
+    RecognitionConfig config = 1;
+
+    // 오디오 스트림 데이터. 연속된 오디오 데이터 조각은 순차적으로 `StreamingRecognizeRequest` 메시지로 전송됩니다.
+    // 오디오 소스는 `LINEAR16` 인코딩을 사용하여 캡처 및 전송되어야 합니다.
+    // 샘플링 레이트는 `16000Hz`여야 합니다. 필요한 경우 오디오를 다시 샘플링하세요.
+    // 모노(1 채널) 오디오만 지원됩니다.
+    bytes audio_content = 2;
+  }
+}
+
+// 요청을 처리하는 방법을 서버에 제공합니다.
+message RecognitionConfig {
+  // 제공할 오디오의 언어를 선택합니다.
+  // 언어 코드는 [BCP-47](https://www.rfc-editor.org/rfc/bcp/bcp47.txt) 표준을 따릅니다.
+  // 이 필드는 생략 가능하나, 생략하면 기본값인 "ko-KR"이 적용됩니다.
+  // 지원되는 언어 코드:
+  // - ko-KR
+  // - en-US
+  string language_code = 1;
+
+  // `true`인 경우, 발화 도중의 임시 부분 결과를 즉시 반환하도록 합니다
+  // (이러한 잠정 결과는 `is_final=false` 플래그로 표시됨).
+  // `false`이거나 생략하면 `is_final=true`인 결과만 반환됩니다.
+  bool interim_results = 2;
+}
+
+// `StreamingRecognizeResponse`는 `StreamingRecognize`에 의해 클라이언트로 반환되는 유일한 메시지입니다. 
+// 0개 이상의 `StreamingRecognizeResponse` 메시지가 클라이언트로 스트리밍됩니다.
+// 각 응답에서는 `error` 또는 `result` 중 하나의 필드만 설정됩니다.
+message StreamingRecognizeResponse {
+  // 현재 처리 중인 오디오 부분에 해당하는 결과.
+  StreamingRecognitionResult result = 1;
+
+  // 스트림에 대한 전체 오디오 지속 시간(초).
+  float total_duration = 2;
+}
+
+// 현재 처리 중인 오디오 부분에 해당하는 스트리밍 음성 인식 결과.
+message StreamingRecognitionResult {
+  // 사용자가 말한 단어를 나타내는 스크립트 텍스트.
+  // 단어를 공백으로 구분하는 언어에서, 이 스크립트가 첫 번째 결과가 아닐 경우 앞에 공백이 포함될 수 있습니다. 
+  // 각 결과를 연결하면 구분자 없이 전체 스크립트를 얻을 수 있습니다.
+  string transcript = 1;
+
+  // `false`인 경우, 이 `StreamingRecognitionResult`는 변경될 수 있는 잠정적인 결과를 나타냅니다.
+  // `true`인 경우, 이전 시작점부터 하나의 완성된 발화 부분까지의 해당 오디오 부분에 대한 완성된 음성 인식 결과를 의미합니다.
+  bool is_final = 2;
+}

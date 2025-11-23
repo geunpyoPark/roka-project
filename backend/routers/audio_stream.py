@@ -1,4 +1,5 @@
 # backend/routers/audio_stream.py
+
 from fastapi import APIRouter, WebSocket
 from backend.mqtt_client import publish
 import time
@@ -8,11 +9,13 @@ import struct
 
 router = APIRouter()
 
+
 def compute_rms(pcm_bytes: bytes) -> float:
     """Int16 PCM 바이트에서 RMS(에너지) 계산"""
-    count = len(pcm_bytes) // 2
+    count = len(pcm_bytes) // 2  # 2바이트 = int16 한 개
     if count == 0:
         return 0.0
+
     samples = struct.unpack("<" + "h" * count, pcm_bytes)
     ssum = 0
     for s in samples:
@@ -23,21 +26,26 @@ def compute_rms(pcm_bytes: bytes) -> float:
 @router.websocket("/audio-stream")
 async def audio_stream(websocket: WebSocket):
     await websocket.accept()
+    user_id = "test-user-1"  # 일단 고정
 
-    # TODO: 나중에는 토큰/쿼리에서 user_id 받아오도록 변경 가능
-    user_id = "test-user-1"
+    print("[audio_stream] WebSocket connected")
 
     try:
         while True:
-            # 브라우저에서 Int16Array로 보낸 오디오
-            pcm_bytes: bytes = await websocket.receive_bytes()
+            # 브라우저에서 Int16Array.buffer 로 보냄 → bytes 로 받음
+            data: bytes = await websocket.receive_bytes()
 
-            # 1) 메타데이터용 RMS 계산
-            rms = compute_rms(pcm_bytes)
-            num_samples = len(pcm_bytes) // 2
+            # 디버깅용: 길이/샘플수/에너지 확인
+            num_samples = len(data) // 2
+            rms = compute_rms(data)
+            # 너무 시끄러우면 로그만 남기고...
+            print(
+                f"[audio_stream] recv {num_samples} samples, rms={rms:.2f}"
+            )
+
             ts = time.time()
 
-            meta_payload = {
+            raw_payload = {
                 "timestamp": ts,
                 "user_id": user_id,
                 "num_samples": num_samples,
@@ -45,14 +53,14 @@ async def audio_stream(websocket: WebSocket):
                 "note": "audio chunk received from websocket",
             }
 
-            # a) 기존처럼 메타데이터 토픽 (speech_worker용)
-            meta_topic = f"interview/{user_id}/audio/raw"
-            publish(meta_topic, json.dumps(meta_payload))
+            # 1) 메타데이터만 담은 raw 토픽
+            publish(
+                f"interview/{user_id}/audio/raw",
+                json.dumps(raw_payload, ensure_ascii=False),
+            )
 
-            # b) 새로 추가: 실제 PCM 파형 토픽 (whisper_worker용)
-            pcm_topic = f"interview/{user_id}/audio/pcm"
-            # paho-mqtt는 bytes payload도 지원하니까 그대로 보냄
-            publish(pcm_topic, pcm_bytes)
+            # 2) 실제 PCM 바이트 (STT용)
+            publish(f"interview/{user_id}/audio/pcm", data)
 
     except Exception as e:
-        print("WebSocket closed in /audio-stream:", e)
+        print("[audio_stream] WebSocket closed or error:", e)
