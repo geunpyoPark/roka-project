@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<body>
+
+<h3>🎤 실시간 Whisper 테스트</h3>
+<button id="start">START</button>
+<pre id="log"></pre>
+
+<script>
+let ws;
+let audioStream;
+let processor;
+let source;
+
+document.getElementById("start").onclick = async () => {
+    ws = new WebSocket("ws://localhost:8000/ws/audio");
+
+    ws.onmessage = (e) => {
+        const d = JSON.parse(e.data);
+        document.getElementById("log").innerText =
+            `전사: ${d.transcript}\n속도: ${d.chars_per_sec.toFixed(2)} cps\n상태: ${d.speed_label}`;
+    };
+
+    audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const audioCtx = new AudioContext({ sampleRate: 16000 });
+
+    source = audioCtx.createMediaStreamSource(audioStream);
+
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    processor.onaudioprocess = (e) => {
+        const input = e.inputBuffer.getChannelData(0);
+        const int16 = Float32ArrayToInt16(input);
+        ws.send(int16);
+    };
+
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+};
+
+function Float32ArrayToInt16(float32Array) {
+    let int16 = new Int16Array(float32Array.length);
+    for (let i = 0; i < float32Array.length; i++) {
+        int16[i] = float32Array[i] * 0x7fff;
+    }
+    return int16;
+}
+</script>
+
+</body>
+</html>

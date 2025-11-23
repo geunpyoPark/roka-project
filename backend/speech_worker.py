@@ -21,34 +21,37 @@ BROKER = "localhost"
 PORT = 1883
 KEEPALIVE = 60
 
-CLIENT_ID = "speech-segment-worker-v3"
+CLIENT_ID = "speech-segment-worker-v4"
 
 # ====== 튜닝 포인트 ======
-# 네 환경 기준 대략:
+# 네 환경 기준:
 #  - 말할 때: rms ~ 2000~10000
 #  - 주변 잡음: 수십~수백
-RMS_THRESHOLD = 800.0      # 필요하면 500~1500 사이 조절
+RMS_THRESHOLD = 600.0          # 말하는 걸로 인식할 최소 RMS (필요하면 400~1000 사이에서 튜닝)
 
-# 말하기 최소 지속 시간 (초) - 이보다 짧으면 노이즈로 간주해서 버림
-MIN_SEGMENT_DURATION = 0.8
+# 말하기 최소 지속 시간 (초) - 이보다 짧으면 노이즈로 간주
+MIN_SEGMENT_DURATION = 0.6
 
-# 세그먼트 최대 길이(초) - 10초 이상이면 잘라냄
+# 세그먼트 최대 길이(초) - 너무 길어지면 잘라냄
 MAX_SEGMENT_DURATION = 10.0
+
+# "진짜 끝났다"고 판단하기 위한 최소 침묵 길이(초)
+MIN_SILENCE_DURATION = 0.4
 
 # 각 사용자별 상태 저장
 # sessions[user_id] = {
 #   "state": "silent" or "speaking",
 #   "segment_start": float | None,
-#   "last_ts": float | None,
+#   "last_voice_ts": float | None,
 #   "max_rms": float
 # }
 sessions: Dict[str, Dict[str, Any]] = {}
 
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
-    print(f"[speech_worker v3] Connected to MQTT broker rc={reason_code}")
+    print(f"[speech_worker v4] Connected to MQTT broker rc={reason_code}")
     client.subscribe("interview/+/audio/raw")
-    print("[speech_worker v3] Subscribed: interview/+/audio/raw")
+    print("[speech_worker v4] Subscribed: interview/+/audio/raw")
 
 
 def on_message(client, userdata, msg):
@@ -56,7 +59,7 @@ def on_message(client, userdata, msg):
         payload_str = msg.payload.decode("utf-8")
         data = json.loads(payload_str)
     except Exception as e:
-        print("[speech_worker v3] JSON decode error:", e)
+        print("[speech_worker v4] JSON decode error:", e)
         print("  topic:", msg.topic)
         print("  raw payload:", msg.payload[:100])
         return
@@ -64,7 +67,7 @@ def on_message(client, userdata, msg):
     # topic 예: interview/test-user-1/audio/raw
     parts = msg.topic.split("/")
     if len(parts) < 3:
-        print("[speech_worker v3] Unexpected topic format:", msg.topic)
+        print("[speech_worker v4] Unexpected topic format:", msg.topic)
         return
 
     _, user_id, _, *_ = parts  # interview / {user_id} / audio / raw
@@ -77,7 +80,7 @@ def on_message(client, userdata, msg):
         sessions[user_id] = {
             "state": "silent",
             "segment_start": None,
-            "last_ts": None,
+            "last_voice_ts": None,
             "max_rms": 0.0,
         }
 
@@ -87,65 +90,75 @@ def on_message(client, userdata, msg):
     is_speaking = rms >= RMS_THRESHOLD
     prev_state = sess["state"]
 
-    # ---- 상태 업데이트 ----
     if is_speaking:
+        # ---- 말하고 있는 구간 ----
         if prev_state == "silent":
             # 새 세그먼트 시작
             sess["state"] = "speaking"
             sess["segment_start"] = timestamp
-            sess["last_ts"] = timestamp
+            sess["last_voice_ts"] = timestamp
             sess["max_rms"] = rms
             print(
-                f"[speech_worker v3] [{user_id}] SPEECH START at {timestamp:.3f} (rms={rms:.1f})"
+                f"[speech_worker v4] [{user_id}] SPEECH START at {timestamp:.3f} (rms={rms:.1f})"
             )
         else:
-            # 말하는 중 계속
-            sess["last_ts"] = timestamp
+            # 이미 말하는 중 → 끝 시간/최대 RMS 갱신
+            sess["last_voice_ts"] = timestamp
             if rms > sess["max_rms"]:
                 sess["max_rms"] = rms
 
     else:
-        # silent 상태
+        # ---- 조용한 구간 ----
         if prev_state == "speaking":
-            # 말이 끊긴 시점 → 세그먼트 종료
-            sess["state"] = "silent"
-            end_ts = sess["last_ts"] if sess["last_ts"] is not None else timestamp
-            start_ts = sess["segment_start"] or timestamp
-            duration = max(0.0, end_ts - start_ts)
+            # 한 번에 바로 끝내지 말고,
+            # 마지막으로 말한 시점(last_voice_ts)에서 일정 시간 이상 조용해야 "진짜 끝"으로 본다.
+            last_voice_ts = sess["last_voice_ts"] or timestamp
+            silence_duration = timestamp - last_voice_ts
 
-            # 0.8초 미만이면 그냥 노이즈로 버림
-            if duration < MIN_SEGMENT_DURATION:
-                print(
-                    f"[speech_worker v3] [{user_id}] SHORT noise ignored "
-                    f"(dur={duration:.2f}s, max_rms={sess['max_rms']:.1f})"
-                )
+            if silence_duration >= MIN_SILENCE_DURATION:
+                # 여기서 세그먼트 종료로 확정
+                start_ts = sess["segment_start"] or timestamp
+                end_ts = last_voice_ts
+                duration = max(0.0, end_ts - start_ts)
+
+                if duration < MIN_SEGMENT_DURATION:
+                    # 너무 짧은 세그먼트 → 노이즈로 버림
+                    print(
+                        f"[speech_worker v4] [{user_id}] SHORT segment ignored "
+                        f"(dur={duration:.2f}s, max_rms={sess['max_rms']:.1f})"
+                    )
+                else:
+                    # 정상 세그먼트 → MQTT 발행
+                    if duration > MAX_SEGMENT_DURATION:
+                        duration = MAX_SEGMENT_DURATION
+                        end_ts = start_ts + duration
+
+                    segment = {
+                        "user_id": user_id,
+                        "start_ts": start_ts,
+                        "end_ts": end_ts,
+                        "duration": duration,
+                        "max_rms": sess["max_rms"],
+                    }
+                    segment_topic = f"interview/{user_id}/speech/segment"
+                    client.publish(segment_topic, json.dumps(segment, ensure_ascii=False))
+                    print(
+                        f"[speech_worker v4] [{user_id}] SEGMENT "
+                        f"{start_ts:.2f} ~ {end_ts:.2f} "
+                        f"(dur={duration:.2f}s, max_rms={sess['max_rms']:.1f})"
+                    )
+
+                # 상태 초기화
+                sess["state"] = "silent"
+                sess["segment_start"] = None
+                sess["last_voice_ts"] = None
+                sess["max_rms"] = 0.0
             else:
-                # 너무 길면 잘라냄
-                if duration > MAX_SEGMENT_DURATION:
-                    duration = MAX_SEGMENT_DURATION
-
-                segment = {
-                    "user_id": user_id,
-                    "start_ts": start_ts,
-                    "end_ts": start_ts + duration,
-                    "duration": duration,
-                    "max_rms": sess["max_rms"],
-                }
-
-                segment_topic = f"interview/{user_id}/speech/segment"
-                client.publish(segment_topic, json.dumps(segment, ensure_ascii=False))
-                print(
-                    f"[speech_worker v3] [{user_id}] SEGMENT "
-                    f"{start_ts:.2f} ~ {start_ts + duration:.2f} "
-                    f"(dur={duration:.2f}s, max_rms={sess['max_rms']:.1f})"
-                )
-
-            # 세그먼트 정보 초기화
-            sess["segment_start"] = None
-            sess["last_ts"] = None
-            sess["max_rms"] = 0.0
+                # 아직 침묵 시간이 짧음 → 여전히 "말하는 중"으로 간주
+                # (state는 speaking 유지, segment는 이어짐)
+                pass
         else:
-            # silent → silent : 아무 작업 없음
+            # silent → silent
             pass
 
 
@@ -158,7 +171,7 @@ def main():
     client.on_message = on_message
 
     client.connect(BROKER, PORT, KEEPALIVE)
-    print("[speech_worker v3] MQTT client connecting...")
+    print("[speech_worker v4] MQTT client connecting...")
 
     client.loop_forever()
 
