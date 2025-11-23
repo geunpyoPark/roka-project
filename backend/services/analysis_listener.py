@@ -1,21 +1,18 @@
 # backend/services/analysis_listener.py
 
 """
-speech_rate_worker, whisper_worker가 퍼블리시하는
+speech_rate_worker 와 whisper_worker 가 퍼블리시하는 결과를 구독해서
+메모리에 저장해 두는 리스너.
 
-  interview/{user_id}/speech/analysis
-  interview/{user_id}/speech/text
-
-를 MQTT로 구독해서,
-backend/services/analysis_cache.py 의
-  update_analysis / update_text
-을 호출해 메모리에 캐싱하는 리스너.
+입력 토픽:
+  - interview/{user_id}/speech/analysis  : 말속도/WPM 분석 결과
+  - interview/{user_id}/speech/text      : STT 텍스트 결과
 """
 
 import json
-from typing import Any
-
+import threading
 import paho.mqtt.client as mqtt
+
 from backend.services.analysis_cache import (
     update_analysis,
     update_text,
@@ -23,81 +20,81 @@ from backend.services.analysis_cache import (
 
 BROKER_HOST = "localhost"
 BROKER_PORT = 1883
+KEEPALIVE = 60
 
-SUB_TOPIC_ANALYSIS = "interview/+/speech/analysis"
-SUB_TOPIC_TEXT = "interview/+/speech/text"
+# 두 토픽 모두 구독
+ANALYSIS_TOPIC = "interview/+/speech/analysis"
+TEXT_TOPIC = "interview/+/speech/text"
+CLIENT_ID = "analysis-listener"
 
-_mqtt_client: mqtt.Client | None = None
 
-
-def _on_connect(client, userdata, flags, reason_code, properties=None):
-    print(f"[analysis_listener] Connected to MQTT broker: rc={reason_code}")
+def on_connect(client, userdata, flags, reason_code, properties=None):
+    print(f"[analysis_listener] Connected: rc={reason_code}")
     if reason_code == 0:
-        client.subscribe(SUB_TOPIC_ANALYSIS)
-        client.subscribe(SUB_TOPIC_TEXT)
-        print(f"[analysis_listener] Subscribed to {SUB_TOPIC_ANALYSIS}")
-        print(f"[analysis_listener] Subscribed to {SUB_TOPIC_TEXT}")
+        # 두 토픽 모두 subscribe
+        client.subscribe(ANALYSIS_TOPIC)
+        client.subscribe(TEXT_TOPIC)
+        print(f"[analysis_listener] Subscribed to {ANALYSIS_TOPIC} and {TEXT_TOPIC}")
     else:
         print("[analysis_listener] MQTT connection failed")
 
 
-def _on_message(client, userdata, msg):
+def on_message(client, userdata, msg):
+    topic = msg.topic
     try:
-        topic = msg.topic  # 예: interview/test-user-1/speech/analysis
-        parts = topic.split("/")
-        if len(parts) < 4:
-            print("[analysis_listener] Invalid topic:", topic)
-            return
-
-        user_id = parts[1]
-        category = parts[2]   # "speech"
-        subtopic = parts[3]   # "analysis" or "text"
-
-        payload_str = msg.payload.decode("utf-8")
-        data: dict[str, Any] = json.loads(payload_str)
-
-        if category == "speech" and subtopic == "analysis":
-            update_analysis(user_id, data)
-            print(
-                f"[analysis_listener] Cached analysis for {user_id}: "
-                f"speed={data.get('speed_label')}"
-            )
-        elif category == "speech" and subtopic == "text":
-            update_text(user_id, data)
-            txt_preview = (data.get("text") or "")[:20]
-            print(
-                f"[analysis_listener] Cached text for {user_id}: '{txt_preview}'"
-            )
-        else:
-            print("[analysis_listener] Unknown topic:", topic)
-
+        payload = json.loads(msg.payload.decode("utf-8"))
     except Exception as e:
-        print("[analysis_listener] on_message error:", e)
-        print("  topic:", msg.topic)
-        print("  payload:", msg.payload[:200])
+        print(f"[analysis_listener] Invalid JSON payload: {e}")
+        return
+
+    parts = topic.split("/")
+    # interview / {user_id} / speech / {analysis|text}
+    if len(parts) < 4:
+        print("[analysis_listener] Unexpected topic:", topic)
+        return
+
+    _, user_id, category, subtopic, *rest = parts
+
+    if category != "speech":
+        print("[analysis_listener] Ignore non-speech topic:", topic)
+        return
+
+    # 말속도 분석 결과
+    if subtopic == "analysis":
+        update_analysis(user_id, payload)
+        print(
+            f"[analysis_listener] Updated ANALYSIS for user={user_id}: "
+            f"text='{payload.get('text')}', wpm={payload.get('wpm')}, "
+            f"label={payload.get('label')}"
+        )
+
+    # STT 텍스트 결과
+    elif subtopic == "text":
+        update_text(user_id, payload)
+        print(
+            f"[analysis_listener] Updated TEXT for user={user_id}: "
+            f"text='{payload.get('text')}'"
+        )
+
+    else:
+        print("[analysis_listener] Ignore subtopic:", subtopic)
 
 
 def start_analysis_listener():
     """
-    backend.main.startup_event()에서 한 번 호출하면 됨.
-    별도 스레드(loop_start)로 MQTT를 돌리면서
-    analysis_cache에 최신 분석/텍스트를 계속 업데이트.
+    FastAPI startup 이벤트에서 호출.
+    별도 스레드로 MQTT loop를 돌린다.
     """
-    global _mqtt_client
-    if _mqtt_client is not None:
-        # 이미 시작되어 있으면 두 번 시작하지 않음
-        return
-
     client = mqtt.Client(
-        client_id=f"analysis-listener-{id(object())}",
+        client_id=CLIENT_ID,
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         protocol=mqtt.MQTTv5,
     )
-    client.on_connect = _on_connect
-    client.on_message = _on_message
+    client.on_connect = on_connect
+    client.on_message = on_message
 
-    client.connect(BROKER_HOST, BROKER_PORT, keepalive=60)
-    client.loop_start()
+    client.connect(BROKER_HOST, BROKER_PORT, KEEPALIVE)
+    print("[analysis_listener] MQTT client started.")
 
-    _mqtt_client = client
-    print("[analysis_listener] MQTT loop started.")
+    th = threading.Thread(target=client.loop_forever, daemon=True)
+    th.start()
