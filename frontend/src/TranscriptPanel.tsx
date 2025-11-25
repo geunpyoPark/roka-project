@@ -15,9 +15,31 @@ export interface TranscriptItem {
   created_at: number;
 }
 
+interface TipResult {
+  summary: string;
+  bullets: string[];
+  speed_comment?: string | null;
+}
+
+interface TranscriptPanelProps {
+  wpm?: number | null;
+  speedLabel?: string;
+  tipResult?: TipResult | null;
+  tipLoading?: boolean;
+  tipError?: string | null;
+  onAssistClick?: () => void;
+}
+
 const USER_ID = "test-user-1";
 
-const TranscriptPanel: React.FC = () => {
+const TranscriptPanel: React.FC<TranscriptPanelProps> = ({
+  wpm,
+  speedLabel,
+  tipResult,
+  tipLoading,
+  tipError,
+  onAssistClick,
+}) => {
   const [activeTab, setActiveTab] = useState<"chat" | "transcript">(
     "transcript"
   );
@@ -78,7 +100,6 @@ const TranscriptPanel: React.FC = () => {
           setItems((prev) => [...prev, ...data]);
           lastIdRef.current = data[data.length - 1].id;
         } catch (e) {
-          // 폴링 중 에러는 조용히 무시 (로그만)
           console.warn("polling error", e);
         }
       }, 1000); // 1초마다 증분 조회
@@ -191,24 +212,55 @@ const TranscriptPanel: React.FC = () => {
   })();
 
   // ---------------------------
+  // Assist 버튼 핸들러
+  // ---------------------------
+  const handleAssistClick = () => {
+    if (onAssistClick) {
+      onAssistClick();
+      setActiveTab("chat"); // 누르면 자동으로 Chat 탭으로 전환
+    }
+  };
+
+  // ---------------------------
   // 3) 렌더링
   // ---------------------------
   return (
-    <section style={{ marginTop: 24 }}>
+    <section style={{ marginTop: 0 }}>
+      {/* 상단 제목 + Assist 버튼 (따로) */}
       <div
         style={{
           display: "flex",
+          justifyContent: "space-between",
           alignItems: "center",
-          gap: 8,
           marginBottom: 6,
         }}
       >
-        <span style={{ fontSize: 14 }}>📑 Transcript</span>
+        <span style={{ fontSize: 14 }}>📑 Transcript / Chat</span>
+
+        <button
+          onClick={handleAssistClick}
+          disabled={tipLoading || !onAssistClick}
+          style={{
+            padding: "6px 12px",
+            borderRadius: 999,
+            border: "1px solid rgba(148,163,184,0.9)",
+            background: tipLoading ? "#4b5563" : "#111827",
+            color: "white",
+            fontSize: 12,
+            cursor:
+              tipLoading || !onAssistClick ? "not-allowed" : "pointer",
+          }}
+        >
+          {tipLoading ? "Assist 생성 중..." : "Assist"}
+        </button>
       </div>
+
       <p style={{ fontSize: 12, color: "#9ca3af", marginBottom: 8 }}>
-        실시간/사후 STT 결과를 화자별로 분리해서 보는 영역입니다.
+        실시간 STT를 화자별로 분리해서 보고, Assist로 다음 답변 스크립트를
+        받아볼 수 있는 영역입니다.
       </p>
 
+      {/* 메인 카드 */}
       <div
         style={{
           borderRadius: 12,
@@ -233,8 +285,7 @@ const TranscriptPanel: React.FC = () => {
               fontSize: 12,
               borderRadius: 999,
               border: "1px solid rgba(75,85,99,0.9)",
-              background:
-                activeTab === "chat" ? "#111827" : "transparent",
+              background: activeTab === "chat" ? "#111827" : "transparent",
               color: activeTab === "chat" ? "#e5e7eb" : "#9ca3af",
               cursor: "pointer",
             }}
@@ -263,14 +314,105 @@ const TranscriptPanel: React.FC = () => {
           <div
             style={{
               minHeight: 180,
-              fontSize: 13,
-              color: "#9ca3af",
+              maxHeight: 260,
+              overflowY: "auto",
+              padding: "4px 2px",
               display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
+              flexDirection: "column",
+              gap: 8,
             }}
           >
-            향후 여기에 면접 보조용 Chat 기능을 넣을 예정입니다.
+            {tipError && (
+              <div
+                style={{
+                  fontSize: 12,
+                  color: "#fecaca",
+                  background: "#7f1d1d",
+                  borderRadius: 8,
+                  padding: "8px 10px",
+                }}
+              >
+                {tipError}
+              </div>
+            )}
+
+            {tipResult && (
+              <div
+                style={{
+                  borderRadius: 10,
+                  border: "1px solid rgba(55,65,81,0.9)",
+                  background: "#020617",
+                  padding: "10px 12px",
+                  fontSize: 12,
+                  color: "#e5e7eb",
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: 12,
+                    fontWeight: 600,
+                    marginBottom: 4,
+                    color: "#facc15",
+                  }}
+                >
+                  🧭 Assist 코칭
+                </div>
+                <div style={{ marginBottom: 6, whiteSpace: "pre-wrap" }}>
+                  {tipResult.summary}
+                </div>
+                {tipResult.bullets?.length > 0 && (
+                  <ul
+                    style={{
+                      paddingLeft: 16,
+                      margin: 0,
+                      marginBottom: 4,
+                    }}
+                  >
+                    {tipResult.bullets.map((b, idx) => (
+                      <li key={idx} style={{ marginBottom: 2 }}>
+                        {b}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {tipResult.speed_comment && (
+                  <div
+                    style={{
+                      marginTop: 4,
+                      fontSize: 11,
+                      color: "#9ca3af",
+                    }}
+                  >
+                    속도 코멘트: {tipResult.speed_comment}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {!tipResult && !tipError && !tipLoading && (
+              <div
+                style={{
+                  fontSize: 12,
+                  color: "#6b7280",
+                  marginTop: 8,
+                }}
+              >
+                아직 Assist 결과가 없습니다. 상단의{" "}
+                <strong>Assist</strong> 버튼을 눌러 스크립트를 생성해 보세요.
+              </div>
+            )}
+
+            {tipLoading && (
+              <div
+                style={{
+                  fontSize: 12,
+                  color: "#9ca3af",
+                  marginTop: 8,
+                }}
+              >
+                Assist 스크립트를 생성하는 중입니다...
+              </div>
+            )}
           </div>
         ) : (
           <div
@@ -284,6 +426,23 @@ const TranscriptPanel: React.FC = () => {
             {transcriptBody}
           </div>
         )}
+      </div>
+
+      {/* ▼ Transcript 아래에 작게 WPM / 속도 평가 표시 */}
+      <div
+        style={{
+          marginTop: 6,
+          fontSize: 11,
+          color: "#9ca3af",
+          display: "flex",
+          gap: 16,
+        }}
+      >
+        <span>
+          말하기 속도:&nbsp;
+          {wpm != null ? `${wpm.toFixed(1)} WPM` : "-"}
+        </span>
+        <span>속도 평가: {speedLabel || "-"}</span>
       </div>
     </section>
   );
