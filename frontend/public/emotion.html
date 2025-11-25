@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>AI 감정 인식 프로 (보정 & 스무딩 적용)</title>
+    <style>
+        body { font-family: 'Pretendard', sans-serif; margin: 0; padding: 20px; background: #f4f7f6; color: #333; }
+        .container { max-width: 1000px; margin: 0 auto; display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
+
+        /* 비디오 영역 */
+        .video-wrapper { position: relative; border-radius: 16px; overflow: hidden; box-shadow: 0 8px 20px rgba(0,0,0,0.15); background: black; aspect-ratio: 4/3; }
+        video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); display: block; }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); pointer-events: none; }
+
+        /* 컨트롤 패널 */
+        .panel { background: white; padding: 25px; border-radius: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); display: flex; flex-direction: column; gap: 15px; }
+
+        h2 { margin: 0 0 10px 0; font-size: 1.5rem; color: #2c3e50; }
+        .btn { padding: 12px 20px; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; transition: all 0.2s; width: 100%; }
+        .btn-primary { background: #3498db; color: white; }
+        .btn-primary:hover { background: #2980b9; }
+        .btn-secondary { background: #e67e22; color: white; }
+        .btn-secondary:hover { background: #d35400; }
+        .btn:disabled { background: #bdc3c7; cursor: not-allowed; }
+
+        /* 결과 표시 영역 */
+        .result-box { text-align: center; padding: 20px; background: #f8f9fa; border-radius: 12px; border: 2px solid #eee; }
+        .emoji { font-size: 4rem; display: block; margin-bottom: 10px; animation: pop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+        .emotion-text { font-size: 1.5rem; font-weight: bold; color: #2c3e50; }
+        .score-text { font-size: 0.9rem; color: #7f8c8d; margin-top: 5px; }
+
+        /* 상태 메시지 */
+        .status-msg { font-size: 0.9rem; color: #666; text-align: center; min-height: 1.2em; }
+
+        /* 데이터 바 */
+        .bar-item { display: flex; justify-content: space-between; align-items: center; font-size: 12px; margin-bottom: 6px; }
+        .bar-bg { flex-grow: 1; height: 6px; background: #e0e0e0; border-radius: 3px; margin: 0 10px; overflow: hidden; }
+        .bar-fill { height: 100%; background: #3498db; transition: width 0.1s linear; }
+
+        @keyframes pop { 0% { transform: scale(0.8); } 100% { transform: scale(1); } }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="video-wrapper">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="output_canvas"></canvas>
+    </div>
+
+    <div class="panel">
+        <h2>😐 AI 표정 분석기</h2>
+
+        <button id="startBtn" class="btn btn-primary">카메라 켜기</button>
+        <button id="calibrateBtn" class="btn btn-secondary" disabled>😐 무표정 보정하기 (3초)</button>
+
+        <p class="status-msg" id="statusText">준비됨</p>
+
+        <div class="result-box">
+            <span id="resultEmoji" class="emoji">😴</span>
+            <div id="resultText" class="emotion-text">대기 중</div>
+            <div id="resultScore" class="score-text">-</div>
+        </div>
+
+        <hr style="width:100%; border:0; border-top:1px solid #eee;">
+        <div style="overflow-y: auto; flex-grow: 1;">
+            <h4>📊 상세 데이터 (보정됨)</h4>
+            <div id="debug-bars"></div>
+        </div>
+    </div>
+</div>
+
+<script type="module">
+import {
+    FaceLandmarker,
+    FilesetResolver,
+    DrawingUtils
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
+
+const video = document.getElementById("webcam");
+const canvasElement = document.getElementById("output_canvas");
+const canvasCtx = canvasElement.getContext("2d");
+const startBtn = document.getElementById("startBtn");
+const calibrateBtn = document.getElementById("calibrateBtn");
+const statusText = document.getElementById("statusText");
+const resultEmoji = document.getElementById("resultEmoji");
+const resultText = document.getElementById("resultText");
+const resultScore = document.getElementById("resultScore");
+const debugBars = document.getElementById("debug-bars");
+
+let faceLandmarker;
+let lastVideoTime = -1;
+let blendShapesHistory = {}; // 스무딩을 위한 이전 값 저장
+const SMOOTHING_FACTOR = 0.2; // 0.1(아주 부드러움/느림) ~ 1.0(즉각반응/떨림)
+
+// 보정 관련 변수
+let neutralBaseline = {}; // 무표정일 때의 기준값
+let isCalibrating = false;
+let calibrationFrames = [];
+
+// 1. 모델 로드
+async function loadModel() {
+    statusText.innerText = "AI 모델 로딩 중...";
+    const filesetResolver = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+    );
+    faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+        baseOptions: {
+            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
+            delegate: "GPU"
+        },
+        outputFaceBlendshapes: true,
+        runningMode: "VIDEO",
+        numFaces: 1
+    });
+    statusText.innerText = "모델 준비 완료. 카메라를 켜주세요.";
+    startBtn.disabled = false;
+}
+loadModel();
+
+// 2. 카메라 시작
+startBtn.addEventListener("click", async () => {
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+        video.srcObject = stream;
+        video.addEventListener("loadeddata", predictLoop);
+        startBtn.style.display = "none";
+        calibrateBtn.disabled = false;
+        statusText.innerText = "분석 중...";
+    } catch (err) {
+        alert("카메라 권한이 필요합니다.");
+    }
+});
+
+// 3. 보정 버튼 클릭 시
+calibrateBtn.addEventListener("click", () => {
+    isCalibrating = true;
+    calibrationFrames = [];
+    calibrateBtn.disabled = true;
+    statusText.innerText = "📸 3초간 무표정을 유지하세요...";
+
+    setTimeout(() => {
+        finishCalibration();
+    }, 3000);
+});
+
+function finishCalibration() {
+    isCalibrating = false;
+    if (calibrationFrames.length > 0) {
+        // 평균값 계산 (Baseline 생성)
+        const sum = {};
+        calibrationFrames.forEach(frame => {
+            for (const cat of frame) {
+                sum[cat.categoryName] = (sum[cat.categoryName] || 0) + cat.score;
+            }
+        });
+
+        for (const key in sum) {
+            neutralBaseline[key] = sum[key] / calibrationFrames.length;
+        }
+
+        statusText.innerText = "✅ 보정 완료! 이제 표정을 지어보세요.";
+        calibrateBtn.disabled = false;
+        calibrateBtn.innerText = "다시 보정하기";
+    } else {
+        statusText.innerText = "❌ 얼굴을 찾지 못했습니다. 다시 시도해주세요.";
+        calibrateBtn.disabled = false;
+    }
+}
+
+// 4. 메인 루프 (예측 및 그리기)
+async function predictLoop() {
+    canvasElement.width = video.videoWidth;
+    canvasElement.height = video.videoHeight;
+    let startTimeMs = performance.now();
+
+    if (lastVideoTime !== video.currentTime) {
+        lastVideoTime = video.currentTime;
+        const results = faceLandmarker.detectForVideo(video, startTimeMs);
+
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+        if (results.faceBlendshapes && results.faceBlendshapes.length > 0) {
+            const rawShapes = results.faceBlendshapes[0].categories;
+
+            // [1] 보정 데이터 수집 중일 때
+            if (isCalibrating) {
+                calibrationFrames.push(rawShapes);
+                // 시각적 피드백 (진행률)
+                const progress = Math.min(100, Math.round((calibrationFrames.length / 90) * 100)); // 30fps * 3s approx
+                statusText.innerText = `📸 보정 중... ${progress}% (무표정 유지)`;
+            } 
+            // [2] 일반 분석 모드
+            else {
+                // 2-1. 스무딩 + 보정 적용
+                const processedShapes = processShapes(rawShapes);
+
+                // 2-2. 감정 판단
+                const emotion = deriveEmotion(processedShapes);
+
+                // 2-3. 결과 업데이트
+                updateUI(emotion);
+                updateDebugBars(processedShapes);
+            }
+        }
+    }
+    window.requestAnimationFrame(predictLoop);
+}
+
+// ★ 핵심: 데이터 전처리 (스무딩 + 보정값 차감)
+function processShapes(rawShapes) {
+    const processed = {};
+
+    rawShapes.forEach(shape => {
+        const name = shape.categoryName;
+        let rawValue = shape.score;
+
+        // A. EMA 스무딩 (이전 값과 현재 값의 가중 평균)
+        const prevValue = blendShapesHistory[name] || rawValue;
+        const smoothedValue = (rawValue * SMOOTHING_FACTOR) + (prevValue * (1 - SMOOTHING_FACTOR));
+        blendShapesHistory[name] = smoothedValue; // 기록 업데이트
+
+        // B. 보정값 적용 (현재값 - 무표정기준값)
+        // 기준값보다 커야만 의미가 있으므로 음수는 0으로 처리
+        let baseline = neutralBaseline[name] || 0;
+        let calibratedValue = Math.max(0, smoothedValue - baseline);
+
+        // 미세한 노이즈 제거 (0.05 미만은 무시)
+        if (calibratedValue < 0.05) calibratedValue = 0;
+
+        processed[name] = calibratedValue;
+    });
+
+    return processed;
+}
+
+// 감정 판단 로직
+function deriveEmotion(shapes) {
+    const get = (name) => shapes[name] || 0;
+
+    const emotions = {
+        happy: (get('mouthSmileLeft') + get('mouthSmileRight')) / 2 * 1.2, // 가중치 부여
+        sad: (get('mouthFrownLeft') + get('mouthFrownRight') + get('browInnerUp')) / 3,
+        angry: (get('browDownLeft') + get('browDownRight')) / 2,
+        surprised: (get('browInnerUp') + get('jawOpen')) / 2,
+        blink: (get('eyeBlinkLeft') + get('eyeBlinkRight')) / 2
+    };
+
+    let maxEmotion = 'neutral';
+    let maxScore = 0;
+
+    // 임계값: 보정 후에는 노이즈가 줄었으므로 조금 더 낮춰도 됨
+    const THRESHOLD = 0.2; 
+
+    for (const [emo, score] of Object.entries(emotions)) {
+        if (score > maxScore && score > THRESHOLD) {
+            maxScore = score;
+            maxEmotion = emo;
+        }
+    }
+
+    return { type: maxEmotion, score: maxScore };
+}
+
+// UI 업데이트
+function updateUI(result) {
+    const map = {
+        neutral: { emoji: '😐', text: '평온' },
+        happy: { emoji: '😄', text: '행복' },
+        sad: { emoji: '😢', text: '슬픔' },
+        angry: { emoji: '😡', text: '화남' },
+        surprised: { emoji: '😲', text: '놀람' },
+        blink: { emoji: '👁️', text: '눈 감음' }
+    };
+
+    const data = map[result.type];
+
+    // 변경될 때만 애니메이션 등을 주려면 이전 값 비교 로직 추가 가능
+    resultEmoji.innerText = data.emoji;
+    resultText.innerText = data.text;
+    resultScore.innerText = `강도: ${Math.round(result.score * 100)}%`;
+
+    // 강도에 따라 텍스트 색상 진하게
+    resultText.style.opacity = Math.max(0.5, Math.min(1, result.score + 0.3));
+}
+
+// 디버그 바 업데이트
+function updateDebugBars(shapes) {
+    // 값이 큰 순서대로 상위 5개만 표시
+    const sorted = Object.entries(shapes)
+        .sort(([,a], [,b]) => b - a)
+        .filter(([,val]) => val > 0.01)
+        .slice(0, 7);
+
+    let html = "";
+    sorted.forEach(([name, val]) => {
+        const pct = Math.round(val * 100);
+        html += `
+            <div class="bar-item">
+                <span style="width:120px; text-align:left;">${name}</span>
+                <div class="bar-bg"><div class="bar-fill" style="width:${pct}%"></div></div>
+                <span style="width:30px; text-align:right;">${pct}</span>
+            </div>
+        `;
+    });
+    debugBars.innerHTML = html;
+}
+
+</script>
+</body>
+</html>

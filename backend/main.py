@@ -3,33 +3,41 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# 분석 REST 라우터
-from backend.routers.analysis import router as analysis_router
-
-# MQTT에서 분석 결과를 가져와 캐시에 넣는 리스너
 from backend.services.analysis_listener import start_analysis_listener
+from backend.routers import analysis as analysis_router
+from backend.routers import tips as tips_router
+from backend.routers import transcript as transcript_router
 
 app = FastAPI(
     title="Interview AI Backend",
-    description="Daglo + speech_rate 연동용 백엔드",
+    description="Daglo + speech_rate + Transcript 뷰어 백엔드",
     version="0.1.0",
 )
 
+# CORS (프론트 로컬 개발용)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 개발 단계
+    allow_origins=["*"],  # 개발 단계라 전체 허용
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# --- 라우터 등록 ---
 # /analysis/{user_id}/latest
-app.include_router(analysis_router)
+app.include_router(analysis_router.router)
+# /tips/{user_id}
+app.include_router(tips_router.router)
+# /transcript/{user_id}
+app.include_router(transcript_router.router)
 
 
 @app.on_event("startup")
 def startup_event():
-    # FastAPI 시작 시 MQTT 분석 리스너 시작
+    """
+    FastAPI 시작 시 MQTT 분석 리스너 시작
+    (speech_rate_worker → MQTT → analysis_listener → analysis_cache)
+    """
     start_analysis_listener()
 
 

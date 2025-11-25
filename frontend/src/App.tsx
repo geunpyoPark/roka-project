@@ -1,282 +1,481 @@
 // frontend/src/App.tsx
+import React, { useCallback, useEffect, useState } from "react";
+import EmotionPanel from "./EmotionPanel";
+import TranscriptPanel from "./TranscriptPanel";
 
-import React, { useEffect, useState } from "react";
-
-const BACKEND_HTTP = "http://localhost:8000";
-const USER_ID = "test-user-1";
-const ANALYSIS_URL = `${BACKEND_HTTP}/analysis/${USER_ID}/latest`;
-
-type AnalysisData = {
+type AnalysisResponse = {
   user_id: string;
-  timestamp: number;
-  duration: number;
   text: string;
-  wpm?: number;
-  label?: string;
-  feedback?: string;
+  wpm: number | null;
+  speed_label: string | null;
+  timestamp: number;
 };
 
-// 라벨별 색상 매핑
-function getLabelColors(label?: string) {
-  const base = {
-    bg: "#020617",
-    border: "rgba(55,65,81,0.9)",
-    text: "#e5e7eb",
-    chipBg: "rgba(15,23,42,0.9)",
-    chipText: "#e5e7eb",
-  };
+type TipResponse = {
+  summary: string;
+  bullets: string[];
+  speed_comment?: string | null;
+};
 
-  if (!label) return base;
+const USER_ID = "test-user-1";
+const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
 
-  switch (label.trim()) {
-    case "너무 빠름":
-      return {
-        ...base,
-        bg: "#451a03",
-        border: "rgba(249,115,22,0.9)",
-        text: "#fed7aa",
-        chipBg: "rgba(248,113,22,0.2)",
-        chipText: "#fdba74",
-      };
-    case "조금 빠름":
-      return {
-        ...base,
-        bg: "#422006",
-        border: "rgba(234,179,8,0.9)",
-        text: "#fef9c3",
-        chipBg: "rgba(234,179,8,0.2)",
-        chipText: "#facc15",
-      };
-    case "적당함":
-      return {
-        ...base,
-        bg: "#022c22",
-        border: "rgba(34,197,94,0.9)",
-        text: "#bbf7d0",
-        chipBg: "rgba(34,197,94,0.2)",
-        chipText: "#4ade80",
-      };
-    case "조금 느림":
-      return {
-        ...base,
-        bg: "#0b1120",
-        border: "rgba(59,130,246,0.9)",
-        text: "#bfdbfe",
-        chipBg: "rgba(59,130,246,0.2)",
-        chipText: "#60a5fa",
-      };
-    case "너무 느림":
-      return {
-        ...base,
-        bg: "#020617",
-        border: "rgba(129,140,248,0.9)",
-        text: "#e0e7ff",
-        chipBg: "rgba(129,140,248,0.2)",
-        chipText: "#a5b4fc",
-      };
-    default:
-      return base;
-  }
-}
+const App: React.FC = () => {
+  const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [lastFetchAt, setLastFetchAt] = useState<number | null>(null);
 
-function App() {
-  const [data, setData] = useState<AnalysisData | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [question, setQuestion] = useState("");
+  const [tipLoading, setTipLoading] = useState(false);
+  const [tip, setTip] = useState<TipResponse | null>(null);
+  const [tipError, setTipError] = useState<string | null>(null);
 
-  const fetchAnalysis = async () => {
+  const fetchLatestAnalysis = useCallback(async () => {
     try {
-      setError(null);
-      const res = await fetch(ANALYSIS_URL);
+      setConnectionError(null);
+      const res = await fetch(
+        `${API_BASE}/analysis/${encodeURIComponent(USER_ID)}/latest`
+      );
       if (!res.ok) {
         if (res.status === 404) {
-          setData(null);
+          setAnalysis(null);
           return;
         }
         throw new Error(`HTTP ${res.status}`);
       }
-      const json = (await res.json()) as AnalysisData;
-      setData(json);
-    } catch (e: any) {
-      console.error("분석 결과 조회 실패:", e);
-      setError("백엔드에 연결할 수 없습니다.");
+      const data = (await res.json()) as AnalysisResponse;
+      setAnalysis(data);
+      setLastFetchAt(Date.now());
+    } catch (err) {
+      console.error(err);
+      setConnectionError("백엔드에 연결할 수 없습니다.");
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchLatestAnalysis();
+    const id = setInterval(fetchLatestAnalysis, 500);
+    return () => clearInterval(id);
+  }, [fetchLatestAnalysis]);
+
+  const handleManualRefresh = () => {
+    fetchLatestAnalysis();
+  };
+
+  const handleGenerateTip = async () => {
+    if (!analysis) {
+      setTipError("먼저 STT 분석 결과가 필요합니다.");
+      return;
+    }
+    setTipError(null);
+    setTipLoading(true);
+    try {
+      const body = {
+        question: question.trim() || "자기소개를 해주세요.",
+        answer_text: analysis.text,
+        wpm: analysis.wpm,
+        speed_label: analysis.speed_label,
+      };
+
+      const res = await fetch(
+        `${API_BASE}/tips/${encodeURIComponent(USER_ID)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }
+      );
+
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.detail || `HTTP ${res.status}`);
+      }
+
+      const data = (await res.json()) as TipResponse;
+      setTip(data);
+    } catch (err: any) {
+      console.error(err);
+      setTipError(err.message || "피드백 생성 중 오류가 발생했습니다.");
+    } finally {
+      setTipLoading(false);
     }
   };
 
-  // 2초마다 자동 폴링
-  useEffect(() => {
-    fetchAnalysis();
-    const timer = setInterval(fetchAnalysis, 2000);
-    return () => clearInterval(timer);
-  }, []);
-
-  const labelColors = getLabelColors(data?.label);
+  const formatTime = (ts: number | null | undefined) => {
+    if (!ts) return "-";
+    const d = new Date(ts * 1000);
+    return d.toLocaleTimeString("ko-KR", { hour12: false });
+  };
 
   return (
     <div
       style={{
-        minHeight: "100vh",
+        height: "100vh",
+        maxHeight: "100vh",
+        overflow: "hidden",
         background: "#020617",
-        color: "white",
+        color: "#e5e7eb",
         display: "flex",
         justifyContent: "center",
-        alignItems: "center",
-        padding: "24px",
-        fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
+        padding: "16px 0",
+        boxSizing: "border-box",
       }}
     >
-      <div
-        style={{
-          width: "100%",
-          maxWidth: "720px",
-          background: "#020617",
-          borderRadius: "16px",
-          padding: "24px 28px 32px",
-          boxShadow: "0 24px 48px rgba(15,23,42,0.8)",
-          border: "1px solid rgba(148,163,184,0.4)",
-        }}
-      >
-        <h1 style={{ fontSize: "22px", fontWeight: 700, marginBottom: "8px" }}>
-          말하기 분석 결과 뷰어 (Daglo + speech_rate)
-        </h1>
-        <p style={{ fontSize: "13px", color: "#9ca3af", marginBottom: "16px" }}>
-          whisper_worker_daglo_mic.py 로 말하면, speech_rate_worker.py 가 계산한 속도·라벨·피드백을 보여줍니다.
-        </p>
-
-        <button
-          onClick={fetchAnalysis}
-          style={{
-            padding: "6px 14px",
-            borderRadius: "999px",
-            border: "1px solid rgba(148,163,184,0.8)",
-            background: "#111827",
-            color: "white",
-            fontSize: "13px",
-            cursor: "pointer",
-            marginBottom: "16px",
-          }}
-        >
-          🔄 지금 바로 새로고침
-        </button>
-
-        {error && (
-          <div
+      <div style={{ width: 1100, maxWidth: "100%", padding: "0 16px" }}>
+        {/* 헤더 */}
+        <header style={{ marginBottom: 16 }}>
+          <h1
             style={{
-              marginBottom: "12px",
-              padding: "10px 12px",
-              borderRadius: "8px",
-              background: "#7f1d1d",
-              fontSize: "13px",
+              margin: 0,
+              fontSize: 24,
+              fontWeight: 700,
             }}
           >
-            {error}
-          </div>
-        )}
+            말하기 분석 결과 뷰어 (Daglo + speech_rate)
+          </h1>
+          <p
+            style={{
+              margin: "4px 0 0",
+              fontSize: 13,
+              color: "#9ca3af",
+            }}
+          >
+            whisper_worker_daglo_mic.py로 실시간 STT, speech_rate_worker.py로
+            계산한 속도·라벨·피드백을 한 화면에서 확인합니다.
+          </p>
+        </header>
 
-        {/* 문장 박스 */}
+        {/* 상단: 말하기 분석 + 표정 분석 */}
         <div
           style={{
-            padding: "14px 14px",
-            borderRadius: "10px",
-            background: "#020617",
-            border: "1px solid rgba(55,65,81,0.9)",
-            minHeight: "80px",
-            fontSize: "14px",
-            whiteSpace: "pre-wrap",
-            marginBottom: "14px",
+            display: "grid",
+            gridTemplateColumns: "minmax(0, 1.15fr) minmax(0, 1fr)",
+            gap: 20,
+            alignItems: "stretch",
           }}
         >
-          {data?.text
-            ? data.text
-            : "아직 분석 결과가 없습니다.\n터미널에서 whisper_worker_daglo_mic.py + speech_rate_worker.py 를 실행하고 말을 해 보세요."}
-        </div>
-
-        {/* WPM & 라벨 카드 */}
-        <div style={{ display: "flex", gap: "12px", marginBottom: "14px", fontSize: "13px" }}>
-          <div
+          {/* 왼쪽: 실시간 말하기 분석 카드 */}
+          <section
             style={{
-              flex: 1,
               background: "#020617",
-              borderRadius: "8px",
-              border: "1px solid rgba(55,65,81,0.9)",
-              padding: "8px 10px",
-            }}
-          >
-            <div style={{ color: "#9ca3af", marginBottom: "4px" }}>WPM (분당 단어 수)</div>
-            <div style={{ fontSize: "18px", fontWeight: 700 }}>
-              {data?.wpm != null ? data.wpm.toFixed(1) : "-"}
-            </div>
-          </div>
-
-          {/* 라벨 카드 - 색상 동적 변경 */}
-          <div
-            style={{
-              flex: 1,
-              borderRadius: "8px",
-              padding: "8px 10px",
-              background: labelColors.bg,
-              border: `1px solid ${labelColors.border}`,
+              borderRadius: 16,
+              border: "1px solid #1f2933",
+              padding: 20,
               display: "flex",
               flexDirection: "column",
-              gap: "6px",
+              gap: 12,
+              minHeight: 320,
             }}
           >
-            <div style={{ color: "#9ca3af", marginBottom: "2px" }}>속도 평가</div>
             <div
               style={{
-                display: "inline-flex",
+                display: "flex",
                 alignItems: "center",
-                alignSelf: "flex-start",
-                padding: "2px 10px",
-                borderRadius: "999px",
-                background: labelColors.chipBg,
-                color: labelColors.chipText,
-                fontSize: "12px",
-                fontWeight: 600,
+                justifyContent: "space-between",
+                marginBottom: 4,
               }}
             >
-              {data?.label ? data.label : "분석 대기중"}
+              <div>
+                <div style={{ fontWeight: 600, fontSize: 16 }}>
+                  🧪 실시간 말하기 분석
+                </div>
+                <div style={{ fontSize: 11, color: "#9ca3af" }}>
+                  한 질문에 대한 답변이 끝난 뒤 1~2초 이내에 최신 결과가
+                  업데이트됩니다.
+                </div>
+              </div>
+              <button
+                onClick={handleManualRefresh}
+                style={{
+                  padding: "6px 10px",
+                  fontSize: 12,
+                  borderRadius: 999,
+                  border: "1px solid #374151",
+                  background: "#020617",
+                  color: "#e5e7eb",
+                  cursor: "pointer",
+                }}
+              >
+                ⟳ 지금 바로 새로고침
+              </button>
             </div>
+
+            {connectionError && (
+              <div
+                style={{
+                  background: "#7f1d1d",
+                  color: "#fee2e2",
+                  padding: "8px 10px",
+                  borderRadius: 8,
+                  fontSize: 12,
+                }}
+              >
+                {connectionError}
+              </div>
+            )}
+
+            {!analysis && !connectionError && (
+              <div
+                style={{
+                  background: "#111827",
+                  borderRadius: 8,
+                  padding: 12,
+                  fontSize: 12,
+                  color: "#9ca3af",
+                }}
+              >
+                아직 분석 결과가 없습니다. 터미널에서
+                <span style={{ marginLeft: 4, fontFamily: "monospace" }}>
+                  whisper_worker_daglo_mic.py
+                </span>
+                와
+                <span
+                  style={{
+                    marginLeft: 4,
+                    fontFamily: "monospace",
+                  }}
+                >
+                  speech_rate_worker.py
+                </span>
+                를 실행한 뒤 말해 보세요.
+              </div>
+            )}
+
+            {analysis && (
+              <div
+                style={{
+                  background: "#020617",
+                  borderRadius: 8,
+                  border: "1px solid #1f2933",
+                  padding: 12,
+                  fontSize: 13,
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: 11,
+                    color: "#6b7280",
+                    marginBottom: 6,
+                  }}
+                >
+                  마지막 업데이트: {formatTime(analysis.timestamp)}
+                </div>
+                <div
+                  style={{
+                    maxHeight: 100,
+                    overflowY: "auto",
+                    paddingRight: 4,
+                    whiteSpace: "pre-wrap",
+                  }}
+                >
+                  {analysis.text}
+                </div>
+              </div>
+            )}
+
             <div
               style={{
-                fontSize: "11px",
-                color: labelColors.text,
-                marginTop: "2px",
+                display: "grid",
+                gridTemplateColumns: "1fr 1fr",
+                gap: 10,
               }}
             >
-              {data?.label
-                ? "라벨 색을 보고 한눈에 속도를 확인해 보세요."
-                : "아직 분석 라벨이 없습니다."}
+              <div
+                style={{
+                  borderRadius: 10,
+                  border: "1px solid #1f2933",
+                  padding: 12,
+                  fontSize: 12,
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: 11,
+                    color: "#9ca3af",
+                    marginBottom: 4,
+                  }}
+                >
+                  WPM (분당 단어 수)
+                </div>
+                <div style={{ fontSize: 20, fontWeight: 600 }}>
+                  {analysis?.wpm != null ? analysis.wpm.toFixed(1) : "-"}
+                </div>
+              </div>
+              <div
+                style={{
+                  borderRadius: 10,
+                  border: "1px solid #1f2933",
+                  padding: 12,
+                  fontSize: 12,
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: 11,
+                    color: "#9ca3af",
+                    marginBottom: 4,
+                  }}
+                >
+                  속도 평가
+                </div>
+                <div style={{ fontSize: 20, fontWeight: 600 }}>
+                  {analysis?.speed_label ?? "-"}
+                </div>
+              </div>
             </div>
-          </div>
+
+            {/* 면접 피드백 섹션 */}
+            <div
+              style={{
+                marginTop: 4,
+                borderTop: "1px solid #1f2933",
+                paddingTop: 12,
+                fontSize: 12,
+                display: "flex",
+                flexDirection: "column",
+                gap: 8,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                }}
+              >
+                <div style={{ fontWeight: 600 }}>🧠 면접 피드백</div>
+                <button
+                  onClick={handleGenerateTip}
+                  disabled={tipLoading}
+                  style={{
+                    padding: "6px 10px",
+                    fontSize: 12,
+                    borderRadius: 999,
+                    border: "none",
+                    background: tipLoading ? "#4b5563" : "#16a34a",
+                    color: "white",
+                    cursor: tipLoading ? "default" : "pointer",
+                  }}
+                >
+                  {tipLoading ? "생성 중..." : "피드백 생성"}
+                </button>
+              </div>
+              <div style={{ color: "#9ca3af", fontSize: 11 }}>
+                최근 답변의 STT 결과와 말 속도를 기반으로 간단한 피드백을
+                생성합니다. 먼저 질문에 대한 답변을 한 뒤, 위 버튼을 눌러
+                보세요.
+              </div>
+              <div>
+                <div
+                  style={{
+                    fontSize: 11,
+                    color: "#9ca3af",
+                    marginBottom: 4,
+                  }}
+                >
+                  면접관 질문 (선택 입력)
+                </div>
+                <textarea
+                  value={question}
+                  onChange={(e) => setQuestion(e.target.value)}
+                  placeholder="예) 자기소개를 해주세요."
+                  rows={2}
+                  style={{
+                    width: "100%",
+                    resize: "vertical",
+                    minHeight: 48,
+                    maxHeight: 80,
+                    borderRadius: 8,
+                    border: "1px solid #1f2933",
+                    background: "#020617",
+                    color: "#e5e7eb",
+                    padding: 8,
+                    fontSize: 13,
+                    boxSizing: "border-box",
+                  }}
+                />
+              </div>
+
+              {tipError && (
+                <div
+                  style={{
+                    background: "#7f1d1d",
+                    color: "#fee2e2",
+                    padding: "8px 10px",
+                    borderRadius: 8,
+                    fontSize: 12,
+                  }}
+                >
+                  {tipError}
+                </div>
+              )}
+
+              {tip && (
+                <div
+                  style={{
+                    marginTop: 4,
+                    borderRadius: 10,
+                    border: "1px solid #1f2933",
+                    padding: 12,
+                    background: "#020617",
+                    maxHeight: 140,
+                    overflowY: "auto",
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: 13,
+                      fontWeight: 600,
+                      marginBottom: 6,
+                    }}
+                  >
+                    {tip.summary}
+                  </div>
+                  {tip.speed_comment && (
+                    <div
+                      style={{
+                        fontSize: 12,
+                        color: "#eab308",
+                        marginBottom: 6,
+                      }}
+                    >
+                      ⚡ {tip.speed_comment}
+                    </div>
+                  )}
+                  {tip.bullets?.length > 0 && (
+                    <ul
+                      style={{
+                        paddingLeft: 18,
+                        margin: 0,
+                        fontSize: 12,
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 2,
+                      }}
+                    >
+                      {tip.bullets.map((b, idx) => (
+                        <li key={idx}>{b}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+            </div>
+          </section>
+
+          {/* 오른쪽: 표정 분석 패널 */}
+          <section>
+            <EmotionPanel />
+          </section>
         </div>
 
-        {/* 피드백 영역 (있으면 사용, 없으면 안내 문구) */}
-        <div
-          style={{
-            marginTop: "4px",
-            padding: "10px 12px",
-            borderRadius: "10px",
-            border: "1px dashed rgba(75,85,99,0.9)",
-            background: "#020617",
-            fontSize: "13px",
-          }}
-        >
-          <div style={{ marginBottom: "4px", color: "#9ca3af", fontSize: "12px" }}>면접 피드백</div>
-          <div style={{ fontSize: "13px", color: "#e5e7eb" }}>
-            {data?.feedback
-              ? data.feedback
-              : "말하기 분석 결과가 들어오면, 이 구간에 현재 스타일 피드백이 표시됩니다."}
-          </div>
-        </div>
-
-        <div style={{ marginTop: "10px", fontSize: "11px", color: "#6b7280" }}>
-          {data?.timestamp && (
-            <>마지막 업데이트: {new Date(data.timestamp * 1000).toLocaleTimeString()}</>
-          )}
+        {/* 하단: Transcript */}
+        <div style={{ marginTop: 20 }}>
+          <TranscriptPanel />
         </div>
       </div>
     </div>
   );
-}
+};
 
 export default App;
