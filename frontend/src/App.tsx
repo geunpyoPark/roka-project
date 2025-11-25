@@ -1,115 +1,129 @@
 // frontend/src/App.tsx
 
 import React, { useEffect, useState } from "react";
+import EmotionPanel from "./EmotionPanel";
+import TranscriptPanel from "./TranscriptPanel";
 
-const BACKEND_HTTP = "http://localhost:8000";
+const BACKEND_BASE = "http://127.0.0.1:8000";
 const USER_ID = "test-user-1";
-const ANALYSIS_URL = `${BACKEND_HTTP}/analysis/${USER_ID}/latest`;
 
-type AnalysisData = {
-  user_id: string;
-  timestamp: number;
-  duration: number;
+interface AnalysisResult {
   text: string;
-  wpm?: number;
-  label?: string;
-  feedback?: string;
-};
-
-// 라벨별 색상 매핑
-function getLabelColors(label?: string) {
-  const base = {
-    bg: "#020617",
-    border: "rgba(55,65,81,0.9)",
-    text: "#e5e7eb",
-    chipBg: "rgba(15,23,42,0.9)",
-    chipText: "#e5e7eb",
-  };
-
-  if (!label) return base;
-
-  switch (label.trim()) {
-    case "너무 빠름":
-      return {
-        ...base,
-        bg: "#451a03",
-        border: "rgba(249,115,22,0.9)",
-        text: "#fed7aa",
-        chipBg: "rgba(248,113,22,0.2)",
-        chipText: "#fdba74",
-      };
-    case "조금 빠름":
-      return {
-        ...base,
-        bg: "#422006",
-        border: "rgba(234,179,8,0.9)",
-        text: "#fef9c3",
-        chipBg: "rgba(234,179,8,0.2)",
-        chipText: "#facc15",
-      };
-    case "적당함":
-      return {
-        ...base,
-        bg: "#022c22",
-        border: "rgba(34,197,94,0.9)",
-        text: "#bbf7d0",
-        chipBg: "rgba(34,197,94,0.2)",
-        chipText: "#4ade80",
-      };
-    case "조금 느림":
-      return {
-        ...base,
-        bg: "#0b1120",
-        border: "rgba(59,130,246,0.9)",
-        text: "#bfdbfe",
-        chipBg: "rgba(59,130,246,0.2)",
-        chipText: "#60a5fa",
-      };
-    case "너무 느림":
-      return {
-        ...base,
-        bg: "#020617",
-        border: "rgba(129,140,248,0.9)",
-        text: "#e0e7ff",
-        chipBg: "rgba(129,140,248,0.2)",
-        chipText: "#a5b4fc",
-      };
-    default:
-      return base;
-  }
+  wpm: number | null;
+  speed_label?: string | null;
+  timestamp: string;
 }
 
-function App() {
-  const [data, setData] = useState<AnalysisData | null>(null);
-  const [error, setError] = useState<string | null>(null);
+interface TipResult {
+  summary: string;
+  bullets: string[];
+  speed_comment?: string | null;
+}
 
-  const fetchAnalysis = async () => {
-    try {
-      setError(null);
-      const res = await fetch(ANALYSIS_URL);
-      if (!res.ok) {
-        if (res.status === 404) {
-          setData(null);
+const App: React.FC = () => {
+  const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+
+  const [tipResult, setTipResult] = useState<TipResult | null>(null);
+  const [tipLoading, setTipLoading] = useState(false);
+  const [tipError, setTipError] = useState<string | null>(null);
+
+  // ------------------ 분석 결과 폴링 ------------------
+  useEffect(() => {
+    let timer: number | undefined;
+
+    const fetchLatest = async () => {
+      try {
+        const res = await fetch(
+          `${BACKEND_BASE}/analysis/${USER_ID}/latest`
+        );
+        if (!res.ok) {
+          setAnalysis(null);
+          setAnalysisError("백엔드에 연결할 수 없습니다.");
           return;
         }
-        throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        setAnalysis({
+          text: data.text ?? "",
+          wpm: data.wpm ?? null,
+          speed_label: data.speed_label ?? null,
+          timestamp: data.timestamp ?? "",
+        });
+        setAnalysisError(null);
+      } catch (err) {
+        console.error(err);
+        setAnalysisError("분석 결과를 불러오는 중 오류가 발생했습니다.");
       }
-      const json = (await res.json()) as AnalysisData;
-      setData(json);
-    } catch (e: any) {
-      console.error("분석 결과 조회 실패:", e);
-      setError("백엔드에 연결할 수 없습니다.");
+    };
+
+    fetchLatest();
+    timer = window.setInterval(fetchLatest, 1000);
+
+    return () => {
+      if (timer) window.clearInterval(timer);
+    };
+  }, []);
+
+  // ------------------ Assist: /tips 호출 ------------------
+  const handleAssistClick = async () => {
+    setTipError(null);
+    setTipResult(null);
+
+    const answerText = analysis?.text || "";
+
+    if (!answerText.trim()) {
+      setTipError(
+        "사용할 답변 텍스트가 없습니다. 먼저 말을 해서 STT 결과가 들어오도록 해 주세요."
+      );
+      return;
+    }
+
+    setTipLoading(true);
+    try {
+      const res = await fetch(`${BACKEND_BASE}/tips/${USER_ID}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          // 지금은 질문을 별도로 안 받으므로 공백/기본값
+          question: "",
+          answer_text: answerText,
+          wpm: analysis?.wpm ?? null,
+          speed_label:
+            analysis?.wpm == null
+              ? null
+              : analysis.wpm < 80
+              ? "조금 느림"
+              : analysis.wpm > 160
+              ? "조금 빠름"
+              : "적당함",
+        }),
+      });
+
+      if (!res.ok) {
+        const detail = await res.text();
+        throw new Error(detail || "Tip API error");
+      }
+
+      const data: TipResult = await res.json();
+      setTipResult(data);
+    } catch (err: any) {
+      console.error(err);
+      setTipError(
+        `Assist 생성 중 오류가 발생했습니다: ${err.message ?? err}`
+      );
+    } finally {
+      setTipLoading(false);
     }
   };
 
-  // 2초마다 자동 폴링
-  useEffect(() => {
-    fetchAnalysis();
-    const timer = setInterval(fetchAnalysis, 2000);
-    return () => clearInterval(timer);
-  }, []);
-
-  const labelColors = getLabelColors(data?.label);
+  const speedLabel =
+    analysis?.wpm == null
+      ? "-"
+      : analysis.wpm < 80
+      ? "조금 느림"
+      : analysis.wpm > 160
+      ? "조금 빠름"
+      : "적당함";
 
   return (
     <div
@@ -119,164 +133,65 @@ function App() {
         color: "white",
         display: "flex",
         justifyContent: "center",
-        alignItems: "center",
-        padding: "24px",
-        fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
       }}
     >
       <div
         style={{
           width: "100%",
-          maxWidth: "720px",
-          background: "#020617",
-          borderRadius: "16px",
-          padding: "24px 28px 32px",
-          boxShadow: "0 24px 48px rgba(15,23,42,0.8)",
-          border: "1px solid rgba(148,163,184,0.4)",
+          maxWidth: 1180,
+          padding: "24px 32px 40px",
+          boxSizing: "border-box",
         }}
       >
-        <h1 style={{ fontSize: "22px", fontWeight: 700, marginBottom: "8px" }}>
-          말하기 분석 결과 뷰어 (Daglo + speech_rate)
-        </h1>
-        <p style={{ fontSize: "13px", color: "#9ca3af", marginBottom: "16px" }}>
-          whisper_worker_daglo_mic.py 로 말하면, speech_rate_worker.py 가 계산한 속도·라벨·피드백을 보여줍니다.
-        </p>
-
-        <button
-          onClick={fetchAnalysis}
-          style={{
-            padding: "6px 14px",
-            borderRadius: "999px",
-            border: "1px solid rgba(148,163,184,0.8)",
-            background: "#111827",
-            color: "white",
-            fontSize: "13px",
-            cursor: "pointer",
-            marginBottom: "16px",
-          }}
-        >
-          🔄 지금 바로 새로고침
-        </button>
-
-        {error && (
-          <div
-            style={{
-              marginBottom: "12px",
-              padding: "10px 12px",
-              borderRadius: "8px",
-              background: "#7f1d1d",
-              fontSize: "13px",
-            }}
-          >
-            {error}
-          </div>
-        )}
-
-        {/* 문장 박스 */}
-        <div
-          style={{
-            padding: "14px 14px",
-            borderRadius: "10px",
-            background: "#020617",
-            border: "1px solid rgba(55,65,81,0.9)",
-            minHeight: "80px",
-            fontSize: "14px",
-            whiteSpace: "pre-wrap",
-            marginBottom: "14px",
-          }}
-        >
-          {data?.text
-            ? data.text
-            : "아직 분석 결과가 없습니다.\n터미널에서 whisper_worker_daglo_mic.py + speech_rate_worker.py 를 실행하고 말을 해 보세요."}
-        </div>
-
-        {/* WPM & 라벨 카드 */}
-        <div style={{ display: "flex", gap: "12px", marginBottom: "14px", fontSize: "13px" }}>
-          <div
-            style={{
-              flex: 1,
-              background: "#020617",
-              borderRadius: "8px",
-              border: "1px solid rgba(55,65,81,0.9)",
-              padding: "8px 10px",
-            }}
-          >
-            <div style={{ color: "#9ca3af", marginBottom: "4px" }}>WPM (분당 단어 수)</div>
-            <div style={{ fontSize: "18px", fontWeight: 700 }}>
-              {data?.wpm != null ? data.wpm.toFixed(1) : "-"}
-            </div>
-          </div>
-
-          {/* 라벨 카드 - 색상 동적 변경 */}
-          <div
-            style={{
-              flex: 1,
-              borderRadius: "8px",
-              padding: "8px 10px",
-              background: labelColors.bg,
-              border: `1px solid ${labelColors.border}`,
-              display: "flex",
-              flexDirection: "column",
-              gap: "6px",
-            }}
-          >
-            <div style={{ color: "#9ca3af", marginBottom: "2px" }}>속도 평가</div>
+        {/* 헤더 */}
+        <header style={{ marginBottom: 16 }}>
+          <h1 style={{ fontSize: 26, margin: 0, marginBottom: 4 }}>
+            Interview Assist Studio
+          </h1>
+          <p style={{ fontSize: 12, color: "#9ca3af" }}>
+            실시간 STT / 말하기 속도 / 표정 분석 + Assist 코칭을 한 화면에서 확인합니다.
+          </p>
+          {analysisError && (
             <div
               style={{
-                display: "inline-flex",
-                alignItems: "center",
-                alignSelf: "flex-start",
-                padding: "2px 10px",
-                borderRadius: "999px",
-                background: labelColors.chipBg,
-                color: labelColors.chipText,
-                fontSize: "12px",
-                fontWeight: 600,
+                marginTop: 6,
+                fontSize: 12,
+                color: "#fecaca",
               }}
             >
-              {data?.label ? data.label : "분석 대기중"}
+              {analysisError}
             </div>
-            <div
-              style={{
-                fontSize: "11px",
-                color: labelColors.text,
-                marginTop: "2px",
-              }}
-            >
-              {data?.label
-                ? "라벨 색을 보고 한눈에 속도를 확인해 보세요."
-                : "아직 분석 라벨이 없습니다."}
-            </div>
-          </div>
-        </div>
-
-        {/* 피드백 영역 (있으면 사용, 없으면 안내 문구) */}
-        <div
-          style={{
-            marginTop: "4px",
-            padding: "10px 12px",
-            borderRadius: "10px",
-            border: "1px dashed rgba(75,85,99,0.9)",
-            background: "#020617",
-            fontSize: "13px",
-          }}
-        >
-          <div style={{ marginBottom: "4px", color: "#9ca3af", fontSize: "12px" }}>면접 피드백</div>
-          <div style={{ fontSize: "13px", color: "#e5e7eb" }}>
-            {data?.feedback
-              ? data.feedback
-              : "말하기 분석 결과가 들어오면, 이 구간에 현재 스타일 피드백이 표시됩니다."}
-          </div>
-        </div>
-
-        <div style={{ marginTop: "10px", fontSize: "11px", color: "#6b7280" }}>
-          {data?.timestamp && (
-            <>마지막 업데이트: {new Date(data.timestamp * 1000).toLocaleTimeString()}</>
           )}
+        </header>
+
+        {/* 상단 2열: 왼쪽 Transcript+Assist / 오른쪽 Emotion */}
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "minmax(0, 3fr) minmax(0, 2.5fr)",
+            gap: 24,
+          }}
+        >
+          {/* 왼쪽: Transcript + Assist */}
+          <section>
+            <TranscriptPanel
+              wpm={analysis?.wpm ?? null}
+              speedLabel={speedLabel}
+              tipResult={tipResult}
+              tipLoading={tipLoading}
+              tipError={tipError}
+              onAssistClick={handleAssistClick}
+            />
+          </section>
+
+          {/* 오른쪽: 표정 분석 */}
+          <section>
+            <EmotionPanel />
+          </section>
         </div>
       </div>
     </div>
   );
-}
+};
 
 export default App;

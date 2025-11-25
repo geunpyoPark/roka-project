@@ -1,52 +1,60 @@
+# backend/services/whisper_worker_daglo_mic.py
 """
-Daglo 마이크 기반 STT 워커 (client.py 스타일 + MQTT 연동)
+Daglo Realtime STT (마이크 입력 버전) + 화자 분리 데모
 
-- 마이크에서 16kHz PCM을 직접 읽어서
-  Daglo Speech.StreamingRecognize로 스트리밍
-- Daglo가 보내주는 최종 텍스트(result.is_final == True)를
-  interview/{user_id}/speech/text 로 MQTT publish
-
-기존 48k → MQTT → 다운샘플링 구조 때문에 음성이 깨져서
-인식이 꼬이는 것 같아서,
-Daglo 공식 client.py와 거의 같은 구조로 가되
-출력만 우리 프로젝트 포맷에 맞추는 버전.
+- 로컬 마이크에서 16kHz PCM 캡쳐 (PyAudio)
+- Daglo gRPC StreamingRecognize 호출
+- 최종 텍스트가 나올 때마다:
+    1) MQTT 로 STT 텍스트 퍼블리시  (speech_rate_worker 용)
+    2) FastAPI 백엔드의 /transcript/{user_id} 에 POST
+       → speaker: "interviewer" 또는 "candidate"
 """
 
 import os
+import sys
 import time
-import json
-import signal
+import queue
+import threading
+from typing import Optional
 
-import pyaudio
 import grpc
+import numpy as np
 import paho.mqtt.client as mqtt
+import pyaudio
+import requests
+
+# backend 모듈 import 위해 sys.path 보정
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
 
 from backend.services.daglo import speech_pb2, speech_pb2_grpc
 
 # ==============================
-# 설정
+# 환경 설정
 # ==============================
 
-# 인터뷰 유저 ID (지금까지 로그 기준)
-USER_ID = "test-user-1"
-
-# Daglo 서버
 DAGLO_SERVER = os.getenv("DAGLO_SERVER", "apis.daglo.ai")
-
-# 반드시 설정 필요: export DAGLO_API_TOKEN="..."
 DAGLO_API_TOKEN = os.getenv("DAGLO_API_TOKEN")
 if not DAGLO_API_TOKEN:
     raise RuntimeError(
-        "[whisper_daglo_mic] 환경변수 DAGLO_API_TOKEN 이 설정되어 있지 않습니다.\n"
-        "  예) export DAGLO_API_TOKEN=\"발급받은_토큰\""
+        "[whisper_daglo_mic] 환경변수 DAGLO_API_TOKEN 이 설정되어 있지 않습니다."
     )
 
-# 오디오 설정 (Daglo 가이드 기준)
-RATE = 16000
-CHUNK_SEC = 0.25  # 0.25초 (client.py와 동일)
-CHUNK_SAMPLES = int(RATE * CHUNK_SEC)  # 4000 샘플
+# FastAPI 백엔드 주소 (Transcript POST용)
+BACKEND_BASE = os.getenv("BACKEND_BASE", "http://127.0.0.1:8000")
+
+# 테스트용 user_id
+USER_ID = os.getenv("INTERVIEW_USER_ID", "test-user-1")
+
+# 마이크 / 오디오 설정
+SAMPLE_RATE = 16000
 CHANNELS = 1
-FORMAT = pyaudio.paInt16  # LINEAR16
+SAMPLE_WIDTH = 2  # int16
+CHUNK_SEC = 0.25
+CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_SEC)  # 4000
+CHUNK_BYTES = CHUNK_SAMPLES * SAMPLE_WIDTH
 
 # MQTT 설정
 BROKER_HOST = "localhost"
@@ -54,170 +62,292 @@ BROKER_PORT = 1883
 KEEPALIVE = 60
 MQTT_CLIENT_ID = "whisper-daglo-mic-worker"
 
+SPEECH_TEXT_TOPIC = f"interview/{USER_ID}/speech/text"
 
-def speech_text_topic(user_id: str) -> str:
-    return f"interview/{user_id}/speech/text"
+# ==============================
+# 글로벌 상태
+# ==============================
+
+GRPC_STUB: Optional[speech_pb2_grpc.SpeechStub] = None
+GRPC_METADATA = None
+
+audio_queue: "queue.Queue[bytes | None]" = queue.Queue()
+
+# Daglo total_duration 추적
+last_total_duration: float = 0.0
+
+# 화자 분리용 turn index
+TURN_INDEX = 0
 
 
 # ==============================
-# gRPC / MQTT 준비
+# 화자 분리 (데모용 로직)
 # ==============================
 
-def create_grpc_stub():
-    creds = grpc.ssl_channel_credentials()
-    channel = grpc.secure_channel(DAGLO_SERVER, creds)
-    stub = speech_pb2_grpc.SpeechStub(channel)
-    metadata = (("authorization", f"Bearer {DAGLO_API_TOKEN}"),)
-    print(f"[whisper_daglo_mic] gRPC channel ready. server={DAGLO_SERVER}")
-    return channel, stub, metadata
+def guess_speaker(text: str, turn_index: int) -> str:
+    """
+    아주 단순한 화자 분리 데모 로직.
+    - 질문스러운 문장(?, '~인가요', '~습니까') → interviewer
+    - 그 외 → candidate
+    - 애매하면 turn_index 짝/홀로 번갈아가며 interviewer/candidate
+    나중에 진짜 diarization 모델을 붙일 때 이 함수만 갈아끼우면 됨.
+    """
+    t = text.strip()
+    if not t:
+        return "candidate"
+
+    # 1) 물음표가 있으면 질문으로 간주
+    if "?" in t:
+        return "interviewer"
+
+    # 2) 한국어 질문 어미들 (간단 예시)
+    question_endings = [
+        "나요", "나요?", "습니까", "습니까?", "세요?", "죠?", "인지요?", "인지요",
+        "인가요", "인가요?"
+    ]
+    if any(t.endswith(end) for end in question_endings):
+        return "interviewer"
+
+    # 3) fallback: 턴 번호 기반 번갈아 태깅
+    if turn_index % 2 == 0:
+        return "interviewer"
+    else:
+        return "candidate"
 
 
-def create_mqtt_client():
+# ==============================
+# MQTT 콜백
+# ==============================
+
+def on_connect(client, userdata, flags, reason_code, properties=None):
+    print(f"[whisper_daglo_mic] MQTT connected rc={reason_code}")
+
+
+def create_mqtt_client() -> mqtt.Client:
     client = mqtt.Client(
         client_id=MQTT_CLIENT_ID,
-        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         protocol=mqtt.MQTTv5,
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
     )
-
-    def on_connect(c, userdata, flags, reason_code, properties=None):
-        print(f"[whisper_daglo_mic] Connected to MQTT broker: rc={reason_code}")
-        if reason_code != 0:
-            print("[whisper_daglo_mic] MQTT connection failed")
-
     client.on_connect = on_connect
     client.connect(BROKER_HOST, BROKER_PORT, KEEPALIVE)
+    client.loop_start()
+    print(
+        f"[whisper_daglo_mic] MQTT client started. "
+        f"broker={BROKER_HOST}:{BROKER_PORT}"
+    )
     return client
 
 
 # ==============================
-# RecognitionConfig & 요청 제너레이터
+# Transcript POST 유틸
+# ==============================
+
+def post_transcript_segment(
+    user_id: str,
+    speaker: str,
+    text: str,
+    start_sec: Optional[float],
+    end_sec: Optional[float],
+):
+    """
+    FastAPI 백엔드의 /transcript/{user_id} 엔드포인트에 한 턴 보내기.
+    backend/routers/transcript.py 의 AppendRequest 형식을 따름.
+    """
+    url = f"{BACKEND_BASE}/transcript/{user_id}"
+    payload = {
+        "speaker": speaker,
+        "text": text,
+        "start_ts": start_sec,
+        "end_ts": end_sec,
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=1.0)
+        if not resp.ok:
+            print(
+                f"[whisper_daglo_mic] POST /transcript 실패 "
+                f"status={resp.status_code}, body={resp.text}"
+            )
+    except Exception as e:
+        print(f"[whisper_daglo_mic] POST /transcript 오류: {e}")
+
+
+# ==============================
+# Daglo gRPC 설정 & 요청/응답
 # ==============================
 
 def build_config() -> speech_pb2.RecognitionConfig:
-    # client.py와 동일한 설정 (필요 시 vad, punctuation 옵션 등 추가 가능)
     return speech_pb2.RecognitionConfig(
         language_code="ko-KR",
-        interim_results=True,  # 중간 결과도 받지만, 우리는 최종만 MQTT로 보냄
+        interim_results=True,
     )
 
 
-def request_generator(audio_stream, stop_flag):
+def request_generator():
     """
-    Daglo StreamingRecognize에 넘길 요청 제너레이터.
-    - 첫 요청은 config
-    - 이후는 마이크에서 읽은 audio_content
+    gRPC StreamingRecognize에 전달할 제너레이터.
+    처음 1번은 config, 이후는 audio_content.
     """
     config = build_config()
-    # 첫 번째 요청: 설정
+    # 첫 요청: 설정
     yield speech_pb2.StreamingRecognizeRequest(config=config)
 
-    # 이후 요청: 오디오 스트리밍
-    while not stop_flag["stop"]:
-        data = audio_stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
-        if not data:
+    # 이후: audio_queue에서 PCM 조각 소비
+    while True:
+        chunk = audio_queue.get()  # type: ignore[assignment]
+        if chunk is None:
             break
-        yield speech_pb2.StreamingRecognizeRequest(audio_content=data)
+        yield speech_pb2.StreamingRecognizeRequest(audio_content=chunk)
 
-    # 마지막 빈 요청으로 스트림 종료 (client.py와 동일)
+    # 마지막 빈 요청
     yield speech_pb2.StreamingRecognizeRequest()
 
 
-# ==============================
-# 메인 루프
-# ==============================
+def handle_response(
+    mqtt_client: mqtt.Client,
+    response: speech_pb2.StreamingRecognizeResponse,
+):
+    global last_total_duration, TURN_INDEX
 
-def main():
-    # Ctrl+C로 깔끔하게 종료하기 위한 플래그
-    stop_flag = {"stop": False}
+    result = response.result
+    if not result:
+        return
 
-    def signal_handler(sig, frame):
-        print("\n[whisper_daglo_mic] Ctrl+C 감지, 종료 중...")
-        stop_flag["stop"] = True
+    transcript = (result.transcript or "").strip()
+    if not transcript:
+        return
 
-    signal.signal(signal.SIGINT, signal_handler)
+    if result.is_final:
+        print(f"[whisper_daglo_mic] FINAL: {transcript}")
+    else:
+        # 부분 결과는 로그만
+        print(f"[whisper_daglo_mic] PARTIAL: {transcript}", end="\r")
+        return
 
-    # gRPC, MQTT, PyAudio 초기화
-    channel, stub, metadata = create_grpc_stub()
-    mqtt_client = create_mqtt_client()
-    mqtt_client.loop_start()  # MQTT는 별도 스레드에서 네트워크 루프
+    # 최종 결과만 아래 처리
+    total_dur = float(response.total_duration or 0.0)
+    seg_dur = max(total_dur - last_total_duration, 0.1)
+    start_sec = max(total_dur - seg_dur, 0.0)
+    end_sec = total_dur
+    last_total_duration = total_dur
 
-    audio = pyaudio.PyAudio()
-    stream = audio.open(
-        format=FORMAT,
-        channels=CHANNELS,
-        rate=RATE,
-        input=True,
-        frames_per_buffer=CHUNK_SAMPLES,
+    # --- 1) MQTT로 STT 퍼블리시 (speech_rate_worker 용) ---
+    payload = {
+        "user_id": USER_ID,
+        "timestamp": time.time(),
+        "duration": seg_dur,
+        "text": transcript,
+    }
+    mqtt_client.publish(
+        SPEECH_TEXT_TOPIC,
+        payload=str(payload).replace("'", '"'),  # 간단 JSON 직렬화
     )
-    print("[whisper_daglo_mic] Mic stream opened. 이제 말하면 됩니다.")
+    print(
+        f"[whisper_daglo_mic] Published STT to {SPEECH_TEXT_TOPIC} "
+        f"(dur={seg_dur:.2f}s, text='{transcript}')"
+    )
 
-    # total_duration 기반으로 구간 길이 계산
+    # --- 2) 화자 추정 + Transcript API에 전송 ---
+    speaker = guess_speaker(transcript, TURN_INDEX)
+    TURN_INDEX += 1
+
+    post_transcript_segment(
+        user_id=USER_ID,
+        speaker=speaker,
+        text=transcript,
+        start_sec=start_sec,
+        end_sec=end_sec,
+    )
+
+
+def run_daglo_stream(mqtt_client: mqtt.Client):
+    """
+    Daglo StreamingRecognize 호출 루프.
+    """
+    global GRPC_STUB, GRPC_METADATA, last_total_duration
+
+    creds = grpc.ssl_channel_credentials()
+    channel = grpc.secure_channel(DAGLO_SERVER, creds)
+    GRPC_STUB = speech_pb2_grpc.SpeechStub(channel)
+    GRPC_METADATA = (("authorization", f"Bearer {DAGLO_API_TOKEN}"),)
+
+    print(f"[whisper_daglo_mic] gRPC channel ready. server={DAGLO_SERVER}")
     last_total_duration = 0.0
 
     try:
-        while not stop_flag["stop"]:
-            print("[whisper_daglo_mic] Opening StreamingRecognize session...")
+        while True:
             try:
-                responses = stub.StreamingRecognize(
-                    request_generator(stream, stop_flag),
-                    metadata=metadata,
+                print("[whisper_daglo_mic] Daglo STT 스트리밍 시작. Ctrl+C 로 종료하세요.")
+                responses = GRPC_STUB.StreamingRecognize(
+                    request_generator(),
+                    metadata=GRPC_METADATA,
                 )
 
-                for response in responses:
-                    if stop_flag["stop"]:
-                        break
+                for res in responses:
+                    handle_response(mqtt_client, res)
 
-                    result = response.result
-                    if not result:
-                        continue
-
-                    transcript = (result.transcript or "").strip()
-                    if not transcript:
-                        continue
-
-                    if result.is_final:
-                        print(f"[whisper_daglo_mic] FINAL: {transcript}")
-                    else:
-                        # 중간 결과는 그냥 콘솔에만 띄워둠
-                        print(f"[whisper_daglo_mic] PARTIAL: {transcript}", end="\r")
-                        continue
-
-                    # 여기까지 왔으면 최종 결과 → speech_rate_worker에게 보내기
-                    total_dur = float(response.total_duration or 0.0)
-                    seg_dur = max(total_dur - last_total_duration, 0.1)
-                    last_total_duration = total_dur
-
-                    payload = {
-                        "user_id": USER_ID,
-                        "timestamp": time.time(),
-                        "duration": seg_dur,
-                        "text": transcript,
-                    }
-                    topic = speech_text_topic(USER_ID)
-                    mqtt_client.publish(topic, json.dumps(payload, ensure_ascii=False))
-                    print(
-                        f"[whisper_daglo_mic] Published STT to {topic} "
-                        f"(dur={seg_dur:.2f}s)"
-                    )
-
-                print("[whisper_daglo_mic] StreamingRecognize session closed by server.")
-
+                print("[whisper_daglo_mic] Stream closed by server.")
+                break
             except grpc.RpcError as e:
-                # 네트워크 끊김 등 에러 나도 다시 붙어서 계속 할 수 있게
-                print(f"[whisper_daglo_mic] gRPC error: {e.code()}, {e.details()}")
+                print(
+                    f"[whisper_daglo_mic] gRPC error: {e.code()}, {e.details()}"
+                )
                 time.sleep(1.0)
-                last_total_duration = 0.0  # 새 세션 기준으로 초기화
-
+                last_total_duration = 0.0
     finally:
-        print("[whisper_daglo_mic] Shutting down...")
-        stop_flag["stop"] = True
+        channel.close()
+        print("[whisper_daglo_mic] gRPC channel closed.")
+
+
+# ==============================
+# 마이크 캡쳐 스레드
+# ==============================
+
+def mic_capture_loop():
+    pa = pyaudio.PyAudio()
+    stream = pa.open(
+        format=pa.get_format_from_width(SAMPLE_WIDTH),
+        channels=CHANNELS,
+        rate=SAMPLE_RATE,
+        input=True,
+        frames_per_buffer=CHUNK_SAMPLES,
+    )
+    print("[whisper_daglo_mic] 마이크 캡처 시작")
+
+    try:
+        while True:
+            data = stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
+            audio_queue.put(data)
+    except KeyboardInterrupt:
+        print("[whisper_daglo_mic] KeyboardInterrupt: 마이크 종료 요청")
+    finally:
+        audio_queue.put(None)
         stream.stop_stream()
         stream.close()
-        audio.terminate()
+        pa.terminate()
+        print("[whisper_daglo_mic] 마이크 캡처 종료")
+
+
+# ==============================
+# main
+# ==============================
+
+def main():
+    mqtt_client = create_mqtt_client()
+
+    # 마이크 스레드
+    mic_thread = threading.Thread(target=mic_capture_loop, daemon=True)
+    mic_thread.start()
+
+    # Daglo gRPC 루프 (메인 스레드)
+    try:
+        run_daglo_stream(mqtt_client)
+    except KeyboardInterrupt:
+        print("[whisper_daglo_mic] 종료 요청 (Ctrl+C)")
+    finally:
         mqtt_client.loop_stop()
         mqtt_client.disconnect()
-        channel.close()
-        print("[whisper_daglo_mic] Bye.")
+        print("[whisper_daglo_mic] MQTT disconnected")
 
 
 if __name__ == "__main__":
